@@ -1,0 +1,76 @@
+# RallyUp — production stack (PRD §15). Pulls the published images for the API
+# (this repo) and the frontend (badminton-fe repo), and runs Postgres + Redis +
+# Nginx. Behind a Cloudflare Tunnel: badminton.boyishesh.com -> nginx:80.
+#
+#   docker compose pull && docker compose up -d
+#
+# The API and FE images are built & pushed by each repo's GitHub Actions.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rallyup
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rallyup}
+      POSTGRES_DB: rallyup
+      TZ: America/Los_Angeles
+    volumes:
+      - rallyup_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rallyup"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  badminton-api:
+    image: vikasm0455/badminton-be-rust:latest
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgres://rallyup:${POSTGRES_PASSWORD:-rallyup}@postgres:5432/rallyup
+      REDIS_URL: redis://redis:6379
+      COOKIE_SECURE: "true"
+      UPLOADS_PATH: /app/uploads
+      TZ: America/Los_Angeles
+    volumes:
+      - rallyup_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    expose:
+      - "8090"
+
+  badminton-fe:
+    image: vikasm0455/badminton-fe:latest
+    restart: unless-stopped
+    environment:
+      API_PROXY: http://badminton-api:8090
+      TZ: America/Los_Angeles
+    depends_on:
+      - badminton-api
+    expose:
+      - "3090"
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80" # point the Cloudflare Tunnel here (or map 80:80)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - badminton-api
+      - badminton-fe
+
+volumes:
+  rallyup_pg_data:
+  rallyup_uploads:

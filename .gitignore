@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+
+# Env / secrets
+.env
+!.env.example
+
+# Runtime uploads (credential screenshots)
+/uploads
+
+# IDE / OS
+.idea/
+.DS_Store
