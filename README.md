@@ -64,9 +64,35 @@ Point a Cloudflare Tunnel (`badminton.boyishesh.com`) at `nginx` (port 8080 → 
 | `DOCKER_USERNAME` | Docker Hub user (`vikasm0455`) |
 | `DOCKER_TOKEN` | Docker Hub access token |
 
+## Metrics
+
+Prometheus metrics are exposed at **`GET /metrics`** (same approach as
+`rust-be-app`):
+
+- `http_requests_total{method,endpoint,status}` and
+  `http_request_duration_seconds{method,endpoint}` — endpoint is the matched
+  route template (e.g. `/api/polls/:id`), so cardinality stays bounded.
+- `downstream_requests_total{dependency,status}` + `..._duration_seconds` for
+  outbound calls (`resend`, `anthropic`).
+- `push_sent_total{result}` — Web Push deliveries (`ok` / `failed` / `gone`).
+
+**`/metrics` is not public.** Set `METRICS_TOKEN` in `.env`; scrapers must send
+`Authorization: Bearer <token>` (mismatch → 404, so the endpoint stays
+invisible). Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: rallyup
+    metrics_path: /metrics
+    authorization:
+      credentials: <METRICS_TOKEN>
+    static_configs:
+      - targets: ["badminton-api:8090"]
+```
+
 ## Env vars
 
 See [.env.example](.env.example). `DATABASE_URL`, `REDIS_URL`, and `JWT_SECRET`
 are enough to boot; `RESEND_API_KEY`, `ANTHROPIC_API_KEY`, and `VAPID_SUBJECT`
 enable email, OCR, and push. VAPID keys are auto-generated on first boot and
-stored in the DB.
+stored in the DB. `METRICS_TOKEN` gates `/metrics`.

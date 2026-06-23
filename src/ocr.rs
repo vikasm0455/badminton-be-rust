@@ -43,16 +43,15 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
         }]
     });
 
-    let resp = state
+    let req = state
         .http
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .timeout(std::time::Duration::from_secs(10)) // PRD §19.1: OCR caps at 10s
-        .json(&body)
-        .send()
-        .await;
+        .json(&body);
+    let resp = crate::downstream::send("anthropic", req).await;
 
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,

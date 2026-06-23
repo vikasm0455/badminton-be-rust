@@ -38,6 +38,10 @@ futures = "0.3"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
+# Observability (Prometheus /metrics, mirrors rust-be-app)
+prometheus = { version = "0.13", features = ["process"] }
+lazy_static = "1.4"
+
 [profile.release]
 opt-level = 3
 lto = true

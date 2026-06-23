@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod config;
+pub mod downstream;
 pub mod email;
 pub mod error;
 pub mod jobs;
+pub mod metrics;
 pub mod models;
 pub mod net;
 pub mod notify;
@@ -17,8 +19,8 @@ pub mod time;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -35,11 +37,13 @@ use net::client_ip;
 use state::AppState;
 
 pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
+    metrics::register_metrics();
     let cors = build_cors(&state.config.allowed_origins);
     let body_limit = (state.config.max_upload_size_mb + 2) * 1024 * 1024;
 
     let mut app = Router::new()
         .route("/health", get(routes::health::health_check))
+        .route("/metrics", get(metrics_endpoint))
         // ---- auth ----------------------------------------------------------
         .route("/api/auth/validate-invite", post(routes::auth::validate_invite))
         .route("/api/auth/signup", post(routes::auth::signup))
@@ -100,6 +104,9 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/admin/polls/:id", delete(routes::admin::delete_poll))
         .route("/api/admin/health", get(routes::admin::system_health))
         // ---- middleware ----------------------------------------------------
+        // route_layer so MatchedPath is populated when track_metrics runs
+        // (gives bounded-cardinality endpoint labels, not raw paths).
+        .route_layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(server_time_header))
         .layer(middleware::from_fn_with_state(state.clone(), api_rate_limit))
         .layer(cors)
@@ -118,6 +125,39 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
     }
 
     app.layer(middleware::from_fn(security_headers))
+}
+
+/// Record per-request metrics using the matched route template as the endpoint
+/// label (bounded cardinality), not the raw path.
+async fn track_metrics(req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_owned();
+    let endpoint = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::record_request(&method, &endpoint, resp.status().as_u16(), elapsed);
+    resp
+}
+
+/// Token-gated `/metrics`. When METRICS_TOKEN is set, require it and answer 404
+/// (not 401) on mismatch so the endpoint stays invisible.
+async fn metrics_endpoint(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(expected) = &state.config.metrics_token {
+        let authorized = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t == expected)
+            .unwrap_or(false);
+        if !authorized {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    metrics::metrics_handler().into_response()
 }
 
 fn request_ip(req: &Request) -> std::net::IpAddr {

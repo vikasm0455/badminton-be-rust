@@ -19,17 +19,15 @@ async fn send_email(state: &AppState, to: &str, subject: &str, text: &str) -> Re
         "text": text,
     });
 
-    let resp = state
+    let req = state
         .http
         .post("https://api.resend.com/emails")
         .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to reach email provider");
-            ApiError::EmailDelivery
-        })?;
+        .json(&body);
+    let resp = crate::downstream::send("resend", req).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to reach email provider");
+        ApiError::EmailDelivery
+    })?;
 
     if !resp.status().is_success() {
         let status = resp.status();

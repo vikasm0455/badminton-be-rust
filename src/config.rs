@@ -28,6 +28,8 @@ pub struct Config {
     /// Browser origins allowed to call the API cross-origin (dev). Empty in
     /// prod where the frontend is same-origin behind Nginx.
     pub allowed_origins: Vec<String>,
+    /// When set, `/metrics` requires `Authorization: Bearer <token>` (404 otherwise).
+    pub metrics_token: Option<String>,
     pub port: u16,
 }
 
@@ -100,6 +102,8 @@ impl Config {
             ],
         };
 
+        let metrics_token = env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty());
+
         let port = env::var("PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -119,6 +123,7 @@ impl Config {
             max_upload_size_mb,
             cookie_secure,
             allowed_origins,
+            metrics_token,
             port,
         })
     }

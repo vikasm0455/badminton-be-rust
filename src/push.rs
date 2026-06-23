@@ -190,6 +190,7 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
         match build_message(state, &sub, &body) {
             Ok(message) => match client.send(message).await {
                 Ok(()) => {
+                    crate::metrics::record_push("ok");
                     let _ = sqlx::query(
                         "UPDATE push_subscriptions SET last_success_at = NOW() WHERE id = $1",
                     )
@@ -198,6 +199,7 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
                     .await;
                 }
                 Err(WebPushError::EndpointNotFound | WebPushError::EndpointNotValid) => {
+                    crate::metrics::record_push("gone");
                     tracing::info!(sub = %sub.id, "push endpoint gone — deactivating");
                     let _ = sqlx::query(
                         "UPDATE push_subscriptions SET active = false WHERE id = $1",
@@ -207,10 +209,14 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
                     .await;
                 }
                 Err(e) => {
+                    crate::metrics::record_push("failed");
                     tracing::warn!(error = %e, sub = %sub.id, "push delivery failed");
                 }
             },
-            Err(e) => tracing::warn!(error = %e, "failed to build push message"),
+            Err(e) => {
+                crate::metrics::record_push("failed");
+                tracing::warn!(error = %e, "failed to build push message");
+            }
         }
     }
 }
