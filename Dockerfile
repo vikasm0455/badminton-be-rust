@@ -1,6 +1,7 @@
 # Stage 1: build the Rust API
 FROM rust:1.88 AS builder
 WORKDIR /app
+ENV SQLX_OFFLINE=true
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
