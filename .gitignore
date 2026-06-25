@@ -6,7 +6,7 @@
 !.env.example
 
 # Runtime uploads (credential screenshots)
-/uploads
+/uploads*
 
 # IDE / OS
 .idea/
