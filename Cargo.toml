@@ -42,6 +42,10 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 prometheus = { version = "0.13", features = ["process"] }
 lazy_static = "1.4"
 
+# Server-side image downscaling before Claude Vision OCR (keeps uploads within
+# Anthropic's 8000px / 10MB limits regardless of the client).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 [profile.release]
 opt-level = 3
 lto = true

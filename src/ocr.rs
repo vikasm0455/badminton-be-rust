@@ -28,8 +28,8 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
         return empty;
     };
 
-    let media_type = if media_type == "image/png" { "image/png" } else { "image/jpeg" };
-    let b64 = STANDARD.encode(image);
+    let (img_bytes, media_type) = prepare_image(image, media_type);
+    let b64 = STANDARD.encode(&img_bytes);
 
     let body = json!({
         "model": state.config.anthropic_model,
@@ -94,6 +94,35 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
     OcrOutcome { name, password, ok }
 }
 
+/// Downscale + JPEG-encode an image so it always fits Claude Vision's limits
+/// (≤ 8000px/side, ≤ 10MB base64) and the bytes match the declared media type.
+/// Belt-and-suspenders alongside the client-side downscale: even a full-res
+/// phone photo or an old client is normalized here. Falls back to the original
+/// bytes if the image can't be decoded.
+fn prepare_image(bytes: &[u8], media_type: &str) -> (Vec<u8>, String) {
+    const MAX_EDGE: u32 = 1568; // standard vision tier; larger is downscaled anyway
+    let original_mt = if media_type == "image/png" { "image/png" } else { "image/jpeg" };
+
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return (bytes.to_vec(), original_mt.to_string());
+    };
+    let resized = if img.width() > MAX_EDGE || img.height() > MAX_EDGE {
+        img.thumbnail(MAX_EDGE, MAX_EDGE) // preserves aspect ratio, downscale only
+    } else {
+        img
+    };
+    let rgb = resized.to_rgb8(); // JPEG has no alpha channel
+
+    let mut buf = Vec::new();
+    {
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
+        if enc.encode_image(&rgb).is_err() {
+            return (bytes.to_vec(), original_mt.to_string());
+        }
+    }
+    (buf, "image/jpeg".to_string())
+}
+
 /// Pull the first {...} block out of a possibly-fenced response.
 fn extract_json(s: &str) -> &str {
     let start = s.find('{');
@@ -135,8 +164,8 @@ pub async fn extract_board(state: &AppState, image: &[u8], media_type: &str) -> 
         return Vec::new();
     };
 
-    let media_type = if media_type == "image/png" { "image/png" } else { "image/jpeg" };
-    let b64 = STANDARD.encode(image);
+    let (img_bytes, media_type) = prepare_image(image, media_type);
+    let b64 = STANDARD.encode(&img_bytes);
 
     let body = json!({
         "model": state.config.anthropic_model,
@@ -229,5 +258,49 @@ fn extract_json_array(s: &str) -> &str {
     match (start, end) {
         (Some(a), Some(b)) if b > a => &s[a..=b],
         _ => "[]",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_of(w: u32, h: u32) -> Vec<u8> {
+        let src = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 80]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(src)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn downscales_oversized_image_to_jpeg() {
+        let png = png_of(3000, 2200);
+        let (out, mt) = prepare_image(&png, "image/png");
+        assert_eq!(mt, "image/jpeg");
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert!(
+            decoded.width() <= 1568 && decoded.height() <= 1568,
+            "still oversized: {}x{}",
+            decoded.width(),
+            decoded.height()
+        );
+    }
+
+    #[test]
+    fn keeps_dimensions_of_small_image() {
+        let png = png_of(800, 600);
+        let (out, mt) = prepare_image(&png, "image/png");
+        assert_eq!(mt, "image/jpeg");
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (800, 600));
+    }
+
+    #[test]
+    fn falls_back_on_undecodable_bytes() {
+        let (out, mt) = prepare_image(b"not an image", "image/png");
+        assert_eq!(out, b"not an image");
+        assert_eq!(mt, "image/png");
     }
 }
