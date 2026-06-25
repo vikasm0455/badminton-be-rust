@@ -2,7 +2,6 @@ use axum::Json;
 use axum::extract::{Multipart, Path, State};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::{AdminUser, AuthUser};
@@ -34,6 +33,29 @@ pub struct ReservationView {
     pub duplicate_warning: bool,
 }
 
+/// A live reservation reduced to the fields that decide a court conflict.
+struct ActiveSlot {
+    court: i16,
+    queue: Option<i16>,
+    half: bool,
+    start: DateTime<Utc>,
+    expiry: DateTime<Utc>,
+}
+
+/// Two live reservations genuinely conflict (warrant a "duplicate" warning) only
+/// when they fight for the SAME physical slot at the SAME time: same court, same
+/// queue position (both NULL = the playing-now slot; a NULL never collides with a
+/// numbered queue slot), overlapping time windows, and not two groups sharing
+/// opposite halves of the court. Distinct queue positions (e.g. #3 and #4) and
+/// back-to-back non-overlapping slots are legitimate and must NOT be flagged.
+fn slots_conflict(a: &ActiveSlot, b: &ActiveSlot) -> bool {
+    a.court == b.court
+        && a.queue == b.queue
+        && a.start < b.expiry
+        && b.start < a.expiry
+        && !(a.half && b.half)
+}
+
 pub async fn today(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -53,18 +75,32 @@ pub async fn today(
     .fetch_all(&state.db)
     .await?;
 
-    // Flag courts with more than one active, non-expired reservation (PRD §7.5).
+    // Flag only genuine same-slot conflicts, not distinct queue positions or
+    // half-court shares (PRD §7.5). Two members queued at #3 and #4 on one court
+    // are expected, not a duplicate.
     let now = time::now();
-    let mut active_per_court: HashMap<i16, i32> = HashMap::new();
-    for r in &rows {
-        if r.status == "active" && r.expiry_at > now {
-            *active_per_court.entry(r.court_number).or_insert(0) += 1;
-        }
-    }
-    for r in &mut rows {
-        if r.status == "active" && r.expiry_at > now {
-            r.duplicate_warning = active_per_court.get(&r.court_number).copied().unwrap_or(0) > 1;
-        }
+    let active: Vec<(usize, ActiveSlot)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.status == "active" && r.expiry_at > now)
+        .map(|(i, r)| {
+            (
+                i,
+                ActiveSlot {
+                    court: r.court_number,
+                    queue: r.queue_number,
+                    half: r.court_type == "half",
+                    start: r.start_at,
+                    expiry: r.expiry_at,
+                },
+            )
+        })
+        .collect();
+    for i in 0..active.len() {
+        let me = &active[i].1;
+        let dup = active.iter().enumerate().any(|(j, (_, other))| j != i && slots_conflict(me, other));
+        let idx = active[i].0;
+        rows[idx].duplicate_warning = dup;
     }
     Ok(Json(ApiResponse::ok(rows)))
 }
@@ -495,4 +531,57 @@ async fn load_one(state: &AppState, id: Uuid) -> Result<Option<ReservationView>,
     .fetch_optional(&state.db)
     .await?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn slot(court: i16, queue: Option<i16>, half: bool, start_min: i64, dur_min: i64) -> ActiveSlot {
+        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let start = base + Duration::minutes(start_min);
+        ActiveSlot { court, queue, half, start, expiry: start + Duration::minutes(dur_min) }
+    }
+
+    #[test]
+    fn distinct_queue_positions_do_not_conflict() {
+        // The reported bug: Suchi at queue #3 and Shalu at queue #4 on Court 22.
+        assert!(!slots_conflict(&slot(22, Some(3), false, 0, 45), &slot(22, Some(4), false, 0, 45)));
+    }
+
+    #[test]
+    fn two_playing_now_full_courts_conflict() {
+        // Both claim the playing-now slot (queue NULL) on the same court, same time.
+        assert!(slots_conflict(&slot(22, None, false, 0, 45), &slot(22, None, false, 0, 45)));
+    }
+
+    #[test]
+    fn playing_now_and_queued_do_not_conflict() {
+        // NULL (playing now) never collides with a numbered queue slot.
+        assert!(!slots_conflict(&slot(22, None, false, 0, 45), &slot(22, Some(1), false, 0, 45)));
+    }
+
+    #[test]
+    fn same_queue_slot_logged_twice_conflicts() {
+        // A genuine accidental duplicate: same court, same queue position, overlapping.
+        assert!(slots_conflict(&slot(9, Some(2), false, 5, 45), &slot(9, Some(2), false, 5, 45)));
+    }
+
+    #[test]
+    fn two_half_court_shares_do_not_conflict() {
+        // Two groups on opposite halves of the same court.
+        assert!(!slots_conflict(&slot(17, None, true, 0, 45), &slot(17, None, true, 0, 45)));
+    }
+
+    #[test]
+    fn back_to_back_non_overlapping_do_not_conflict() {
+        // 0..45 then 45..90 on the same court — sequential, legitimate.
+        assert!(!slots_conflict(&slot(5, None, false, 0, 45), &slot(5, None, false, 45, 45)));
+    }
+
+    #[test]
+    fn different_courts_never_conflict() {
+        assert!(!slots_conflict(&slot(1, None, false, 0, 45), &slot(2, None, false, 0, 45)));
+    }
 }
