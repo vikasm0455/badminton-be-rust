@@ -84,7 +84,7 @@ impl Config {
         let max_upload_size_mb = env::var("MAX_UPLOAD_SIZE_MB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(15);
 
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

@@ -15,6 +15,7 @@ pub mod routes;
 pub mod security;
 pub mod state;
 pub mod time;
+pub mod upload;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -39,7 +40,9 @@ use state::AppState;
 pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
     metrics::register_metrics();
     let cors = build_cors(&state.config.allowed_origins);
-    let body_limit = (state.config.max_upload_size_mb + 2) * 1024 * 1024;
+    // Headroom above the per-upload cap so the handler's own size check trips
+    // first and can drain the body cleanly (see upload::read_image_field).
+    let body_limit = (state.config.max_upload_size_mb + 10) * 1024 * 1024;
 
     let mut app = Router::new()
         .route("/health", get(routes::health::health_check))
@@ -70,6 +73,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         // ---- reservations --------------------------------------------------
         .route("/api/reservations/today", get(routes::reservations::today))
         .route("/api/reservations/stream", get(routes::stream::reservations_stream))
+        .route("/api/reservations/scan-board", post(routes::reservations::scan_board))
         .route("/api/reservations", post(routes::reservations::create))
         .route("/api/reservations/credentials/:id/unlock", put(routes::reservations::unlock_credential))
         .route("/api/reservations/:id", put(routes::reservations::edit))

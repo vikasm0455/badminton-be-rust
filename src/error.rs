@@ -22,6 +22,8 @@ pub enum ApiError {
     EmailDelivery,
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("database error")]
     Db(#[from] sqlx::Error),
     #[error("internal error")]
@@ -41,6 +43,7 @@ impl IntoResponse for ApiError {
             ApiError::TooManyRequests | ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::EmailDelivery => StatusCode::BAD_GATEWAY,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Db(e) => {
                 tracing::error!(error = %e, "database query failed");
                 StatusCode::INTERNAL_SERVER_ERROR

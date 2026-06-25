@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Multipart, Path, State};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::error::ApiError;
 use crate::models::ApiResponse;
 use crate::state::{AppState, LiveEvent};
-use crate::{notify, time};
+use crate::{notify, ocr, time};
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct ReservationView {
@@ -200,6 +200,160 @@ pub async fn create(
 
     let view = load_one(&state, id.0).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse::ok(view)))
+}
+
+// ---- board scan -------------------------------------------------------------
+
+/// One posted login matched onto a court read from the status board, with a
+/// suggested reservation the user can confirm/edit before it's created.
+#[derive(Serialize)]
+pub struct BoardMatch {
+    pub credential_id: Uuid,
+    pub bintang_name: String,
+    /// This login is already locked to an active reservation.
+    pub already_in_use: bool,
+    pub in_use_court: Option<i16>,
+    pub court_number: i16,
+    pub minutes_left: Option<i16>,
+    /// "current" (playing now) | "queue" (waiting).
+    pub location: String,
+    pub queue_position: Option<i16>,
+    pub current_players: Vec<String>,
+    pub queue: Vec<String>,
+    pub player_count: i16,
+    pub court_type: String,
+    /// Suggested timer plan, mirroring CreateReservationReq.
+    pub start_type: String,
+    /// Minutes from now until the court starts (0 when playing now).
+    pub start_in_minutes: i16,
+    pub duration_minutes: i16,
+}
+
+#[derive(Serialize)]
+pub struct BoardScanResult {
+    pub matches: Vec<BoardMatch>,
+    pub detected_courts: usize,
+    pub message: String,
+}
+
+/// Case-insensitive, token-based fuzzy match of a kiosk login name against the
+/// (OCR-noisy) names read off the board. Tokens shorter than 3 chars are ignored
+/// to avoid spurious hits. The user reviews every match, so we err toward recall.
+fn name_matches(login: &str, board_names: &[String]) -> bool {
+    let login_l = login.to_lowercase();
+    let login_tokens: Vec<&str> = login_l
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .collect();
+    for bn in board_names {
+        let bn_l = bn.to_lowercase();
+        if bn_l == login_l {
+            return true;
+        }
+        if login_tokens.iter().any(|t| bn_l.contains(t)) {
+            return true;
+        }
+        if bn_l
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() >= 3)
+            .any(|bt| login_l.contains(bt))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// OCR the facility status board, match today's posted logins onto it, and
+/// return a reviewable list of suggested reservations (timers read off the
+/// board). Creates nothing — the client confirms via the normal create route.
+pub async fn scan_board(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    multipart: Multipart,
+) -> Result<Json<ApiResponse<BoardScanResult>>, ApiError> {
+    let max_bytes = state.config.max_upload_size_mb * 1024 * 1024;
+    let (bytes, content_type) = crate::upload::read_image_field(multipart, max_bytes).await?;
+
+    // Today's posted logins + the court each is currently locked to (if any).
+    let creds: Vec<(Uuid, String, Option<i16>)> = sqlx::query_as(
+        "SELECT c.id, c.bintang_name,
+                (SELECT r.court_number FROM court_reservations r
+                   WHERE r.credential_id = c.id AND r.status = 'active' AND r.expiry_at > NOW()
+                   ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
+         FROM court_credentials c WHERE c.game_date = $1",
+    )
+    .bind(time::today())
+    .fetch_all(&state.db)
+    .await?;
+
+    let board = ocr::extract_board(&state, &bytes, &content_type).await;
+    let detected = board.len();
+
+    let mut matches = Vec::new();
+    for (cid, name, in_use_court) in &creds {
+        // Prefer a "currently playing" match; fall back to the queue.
+        let mut found: Option<(usize, &'static str, Option<i16>)> = None;
+        for (i, bc) in board.iter().enumerate() {
+            if name_matches(name, &bc.current_players) {
+                found = Some((i, "current", None));
+                break;
+            }
+        }
+        if found.is_none() {
+            for (i, bc) in board.iter().enumerate() {
+                if let Some(p) = bc
+                    .queue
+                    .iter()
+                    .position(|q| name_matches(name, std::slice::from_ref(q)))
+                {
+                    found = Some((i, "queue", Some((p + 1) as i16)));
+                    break;
+                }
+            }
+        }
+        let Some((idx, location, queue_position)) = found else { continue };
+        let bc = &board[idx];
+
+        let player_count = bc.current_players.len().clamp(1, 8) as i16;
+        let court_type = if bc.current_players.len() == 2 { "half" } else { "full" };
+        let (start_type, start_in_minutes, duration_minutes) = if location == "current" {
+            // Playing now → reservation runs out when the board's minutes-left hits 0.
+            ("now", 0i16, bc.minutes_left.map(|m| m.clamp(1, 45)).unwrap_or(45))
+        } else {
+            // Queued → starts when the current group frees the court (minutes-left),
+            // then runs a standard 45-minute group-play slot.
+            ("at_time", bc.minutes_left.map(|m| m.clamp(2, 170)).unwrap_or(15), 45)
+        };
+
+        matches.push(BoardMatch {
+            credential_id: *cid,
+            bintang_name: name.clone(),
+            already_in_use: in_use_court.is_some(),
+            in_use_court: *in_use_court,
+            court_number: bc.court_number,
+            minutes_left: bc.minutes_left,
+            location: location.to_string(),
+            queue_position,
+            current_players: bc.current_players.clone(),
+            queue: bc.queue.clone(),
+            player_count,
+            court_type: court_type.to_string(),
+            start_type: start_type.to_string(),
+            start_in_minutes,
+            duration_minutes,
+        });
+    }
+
+    let message = if detected == 0 {
+        "Couldn't read the board clearly. Try a closer, straight-on photo — or log courts manually.".to_string()
+    } else if matches.is_empty() {
+        format!("Read {detected} court(s) but none matched a posted login. Post your court logins first, then rescan.")
+    } else {
+        format!("Matched {} of your login(s) across {detected} court(s) on the board.", matches.len())
+    };
+
+    Ok(Json(ApiResponse::ok(BoardScanResult { matches, detected_courts: detected, message })))
 }
 
 pub async fn complete(

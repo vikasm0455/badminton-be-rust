@@ -141,31 +141,10 @@ pub struct OcrResult {
 pub async fn ocr_credential(
     State(state): State<AppState>,
     user: AuthUser,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<Json<ApiResponse<OcrResult>>, ApiError> {
     let max_bytes = state.config.max_upload_size_mb * 1024 * 1024;
-    let mut image: Option<(Vec<u8>, String)> = None;
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        ApiError::BadRequest(format!("invalid upload: {e}"))
-    })? {
-        if field.name() == Some("image") {
-            let content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-            let data = field.bytes().await.map_err(|_| {
-                ApiError::BadRequest("Photo too large (max 10MB). Retake or enter manually.".into())
-            })?;
-            if data.len() > max_bytes {
-                return Err(ApiError::BadRequest(
-                    "Photo too large (max 10MB). Retake or enter manually.".into(),
-                ));
-            }
-            if content_type != "image/jpeg" && content_type != "image/png" {
-                return Err(ApiError::BadRequest("Only JPEG or PNG photos are accepted.".into()));
-            }
-            image = Some((data.to_vec(), content_type));
-        }
-    }
-    let (bytes, content_type) = image.ok_or_else(|| ApiError::BadRequest("no image provided".into()))?;
+    let (bytes, content_type) = crate::upload::read_image_field(multipart, max_bytes).await?;
 
     // Persist the screenshot (cleared nightly with the credential).
     let dir = creds_dir(&state, time::today());
