@@ -44,7 +44,10 @@ pub async fn today(
             "SELECT c.id, c.bintang_name, c.bintang_password, c.posted_by,
                     u.display_name, c.posted_at, c.screenshot_path,
                     (SELECT r.court_number FROM court_reservations r
-                       WHERE r.credential_id = c.id AND r.status = 'active' AND r.expiry_at > NOW()
+                       WHERE (r.credential_id = c.id
+                              OR EXISTS (SELECT 1 FROM reservation_credentials rc
+                                         WHERE rc.reservation_id = r.id AND rc.credential_id = c.id))
+                         AND r.status = 'active' AND r.expiry_at > NOW()
                        ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
              FROM court_credentials c JOIN users u ON u.id = c.posted_by
              WHERE c.game_date = $1

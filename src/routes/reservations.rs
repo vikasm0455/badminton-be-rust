@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::auth::{AdminUser, AuthUser};
 use crate::error::ApiError;
 use crate::models::ApiResponse;
+use crate::ocr::BoardCourt;
 use crate::state::{AppState, LiveEvent};
 use crate::{notify, ocr, time};
 
@@ -16,6 +17,10 @@ pub struct ReservationView {
     pub court_number: i16,
     pub credential_id: Option<Uuid>,
     pub credential_name: Option<String>,
+    /// Comma-joined names of every login attached to this reservation (a whole
+    /// group on one court). Falls back to credential_name for legacy rows.
+    #[sqlx(default)]
+    pub attached_logins: Option<String>,
     pub reserved_by: Uuid,
     pub reserved_by_name: String,
     pub court_type: String,
@@ -62,6 +67,11 @@ pub async fn today(
 ) -> Result<Json<ApiResponse<Vec<ReservationView>>>, ApiError> {
     let mut rows: Vec<ReservationView> = sqlx::query_as(
         "SELECT r.id, r.court_number, r.credential_id, r.credential_name_snapshot AS credential_name,
+                COALESCE(
+                    (SELECT string_agg(rc.name_snapshot, ', ' ORDER BY rc.name_snapshot)
+                     FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
+                    r.credential_name_snapshot
+                ) AS attached_logins,
                 r.reserved_by, u.display_name AS reserved_by_name, r.court_type, r.player_count,
                 r.duration_minutes, r.start_at, r.expiry_at, r.queue_number, r.notes, r.status,
                 r.completed_at, cu.display_name AS completed_by_name, r.created_at
@@ -108,7 +118,12 @@ pub async fn today(
 #[derive(Deserialize)]
 pub struct CreateReservationReq {
     pub court_number: i16,
+    /// Single login (manual reservation form). Kept for back-compat.
     pub credential_id: Option<Uuid>,
+    /// Multiple logins attached to one court (board scan). Takes precedence over
+    /// credential_id when non-empty; all are locked to this reservation.
+    #[serde(default)]
+    pub credential_ids: Option<Vec<Uuid>>,
     pub court_type: String,
     pub player_count: Option<i16>,
     pub duration_minutes: Option<i16>,
@@ -174,9 +189,18 @@ pub async fn create(
         _ => return Err(ApiError::BadRequest("start type must be now or at_time".into())),
     };
 
-    // Resolve + lock the credential, snapshotting its name (survives midnight).
-    let mut credential_name: Option<String> = None;
-    if let Some(cid) = req.credential_id {
+    // Resolve + lock every login to attach. The board scan sends several logins
+    // for one court; the manual form sends one. Each must be today's and free.
+    let cred_ids: Vec<Uuid> = match &req.credential_ids {
+        Some(v) if !v.is_empty() => {
+            let mut seen = std::collections::HashSet::new();
+            v.iter().copied().filter(|id| seen.insert(*id)).collect()
+        }
+        _ => req.credential_id.into_iter().collect(),
+    };
+
+    let mut attached: Vec<(Uuid, String)> = Vec::new();
+    for cid in &cred_ids {
         let cred: Option<(String, chrono::NaiveDate)> =
             sqlx::query_as("SELECT bintang_name, game_date FROM court_credentials WHERE id = $1")
                 .bind(cid)
@@ -186,29 +210,38 @@ pub async fn create(
         if gdate != time::today() {
             return Err(ApiError::BadRequest("that credential is not for today".into()));
         }
+        // Locked if attached to any active reservation — legacy credential_id or
+        // the join table (a login can only be on one court at a time).
         let locked: Option<(i16,)> = sqlx::query_as(
-            "SELECT court_number FROM court_reservations
-             WHERE credential_id = $1 AND status = 'active' AND expiry_at > NOW() LIMIT 1",
+            "SELECT cr.court_number FROM court_reservations cr
+             WHERE cr.status = 'active' AND cr.expiry_at > NOW()
+               AND (cr.credential_id = $1
+                    OR EXISTS (SELECT 1 FROM reservation_credentials rc
+                               WHERE rc.reservation_id = cr.id AND rc.credential_id = $1))
+             LIMIT 1",
         )
         .bind(cid)
         .fetch_optional(&state.db)
         .await?;
         if let Some((court,)) = locked {
-            return Err(ApiError::Conflict(format!("That credential is in use — Court {court}.")));
+            return Err(ApiError::Conflict(format!("{name}'s login is in use — Court {court}.")));
         }
-        credential_name = Some(name);
+        attached.push((*cid, name));
     }
 
+    let primary_id = attached.first().map(|(id, _)| *id);
+    let primary_name = attached.first().map(|(_, n)| n.clone());
+
     let expiry_at = start_at + Duration::minutes(duration as i64);
-    let id: (Uuid,) = sqlx::query_as(
+    let inserted = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO court_reservations
             (court_number, credential_id, credential_name_snapshot, reserved_by, court_type,
              player_count, duration_minutes, start_at, expiry_at, queue_number, notes, game_date)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(req.court_number)
-    .bind(req.credential_id)
-    .bind(&credential_name)
+    .bind(primary_id)
+    .bind(&primary_name)
     .bind(user.id)
     .bind(&req.court_type)
     .bind(req.player_count)
@@ -219,7 +252,31 @@ pub async fn create(
     .bind(notes)
     .bind(time::today())
     .fetch_one(&state.db)
-    .await?;
+    .await;
+    let id: (Uuid,) = match inserted {
+        Ok(v) => v,
+        // Unique-index violation = a real duplicate for the same queue slot.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            return Err(ApiError::Conflict(format!(
+                "Court {} already has an active reservation for that queue slot.",
+                req.court_number
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Attach every locked login to the new reservation (one court, many logins).
+    for (cid, name) in &attached {
+        sqlx::query(
+            "INSERT INTO reservation_credentials (reservation_id, credential_id, name_snapshot)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(id.0)
+        .bind(cid)
+        .bind(name)
+        .execute(&state.db)
+        .await?;
+    }
 
     state.broadcast(LiveEvent::ReservationsChanged);
 
@@ -240,14 +297,18 @@ pub async fn create(
 
 // ---- board scan -------------------------------------------------------------
 
-/// One posted login matched onto a court read from the status board, with a
-/// suggested reservation the user can confirm/edit before it's created.
+/// One COURT read from the status board with all of the group's posted logins
+/// that matched onto it, as a single suggested reservation (one timer per court)
+/// the user can confirm/edit before it's created.
 #[derive(Serialize)]
 pub struct BoardMatch {
-    pub credential_id: Uuid,
-    pub bintang_name: String,
-    /// This login is already locked to an active reservation.
-    pub already_in_use: bool,
+    /// Every matched login on this court.
+    pub credential_ids: Vec<Uuid>,
+    pub bintang_names: Vec<String>,
+    /// The subset of credential_ids already locked to another active reservation
+    /// (they'll be skipped when this court is logged).
+    pub already_in_use_ids: Vec<Uuid>,
+    /// A court one of the matched logins is already on (for the UI hint).
     pub in_use_court: Option<i16>,
     pub court_number: i16,
     pub minutes_left: Option<i16>,
@@ -315,7 +376,10 @@ pub async fn scan_board(
     let creds: Vec<(Uuid, String, Option<i16>)> = sqlx::query_as(
         "SELECT c.id, c.bintang_name,
                 (SELECT r.court_number FROM court_reservations r
-                   WHERE r.credential_id = c.id AND r.status = 'active' AND r.expiry_at > NOW()
+                   WHERE (r.credential_id = c.id
+                          OR EXISTS (SELECT 1 FROM reservation_credentials rc
+                                     WHERE rc.reservation_id = r.id AND rc.credential_id = c.id))
+                     AND r.status = 'active' AND r.expiry_at > NOW()
                    ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
          FROM court_credentials c WHERE c.game_date = $1",
     )
@@ -326,34 +390,71 @@ pub async fn scan_board(
     let board = ocr::extract_board(&state, &bytes, &content_type).await;
     let detected = board.len();
 
-    let mut matches = Vec::new();
-    for (cid, name, in_use_court) in &creds {
-        // Prefer a "currently playing" match; fall back to the queue.
-        let mut found: Option<(usize, &'static str, Option<i16>)> = None;
-        for (i, bc) in board.iter().enumerate() {
-            if name_matches(name, &bc.current_players) {
-                found = Some((i, "current", None));
-                break;
-            }
-        }
-        if found.is_none() {
+    let matches = build_matches(&creds, &board);
+
+    let message = if detected == 0 {
+        "Couldn't read the board clearly. Try a closer, straight-on photo — or log courts manually.".to_string()
+    } else if matches.is_empty() {
+        format!("Read {detected} court(s) but none matched a posted login. Post your court logins first, then rescan.")
+    } else {
+        format!("Matched {} of your login(s) across {detected} court(s) on the board.", matches.len())
+    };
+
+    Ok(Json(ApiResponse::ok(BoardScanResult { matches, detected_courts: detected, message })))
+}
+
+/// Group the matched logins by court: one suggested reservation per court (one
+/// timer), with every login that landed on that court attached. A court is
+/// "playing now" if any of its matched logins is in the current-players line,
+/// otherwise it's queued at the earliest matched queue position.
+fn build_matches(creds: &[(Uuid, String, Option<i16>)], board: &[BoardCourt]) -> Vec<BoardMatch> {
+    // Resolve each login to its single best board panel (current beats queue).
+    let resolved: Vec<Option<(usize, bool, Option<i16>)>> = creds
+        .iter()
+        .map(|(_, name, _)| {
             for (i, bc) in board.iter().enumerate() {
-                if let Some(p) = bc
-                    .queue
-                    .iter()
-                    .position(|q| name_matches(name, std::slice::from_ref(q)))
-                {
-                    found = Some((i, "queue", Some((p + 1) as i16)));
-                    break;
+                if name_matches(name, &bc.current_players) {
+                    return Some((i, true, None));
                 }
             }
+            for (i, bc) in board.iter().enumerate() {
+                if let Some(p) = bc.queue.iter().position(|q| name_matches(name, std::slice::from_ref(q))) {
+                    return Some((i, false, Some((p + 1) as i16)));
+                }
+            }
+            None
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for (bi, bc) in board.iter().enumerate() {
+        // Every login that resolved to this court panel.
+        let members: Vec<(usize, bool, Option<i16>)> = resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, &r)| r.and_then(|(idx, cur, qp)| (idx == bi).then_some((ci, cur, qp))))
+            .collect();
+        if members.is_empty() {
+            continue;
         }
-        let Some((idx, location, queue_position)) = found else { continue };
-        let bc = &board[idx];
+
+        let has_current = members.iter().any(|(_, cur, _)| *cur);
+        let min_qpos = members.iter().filter_map(|(_, _, qp)| *qp).min();
+        let location = if has_current { "current" } else { "queue" };
+        let queue_position = if has_current { None } else { min_qpos.map(|p| p.clamp(1, 5)) };
+
+        let credential_ids: Vec<Uuid> = members.iter().map(|(ci, _, _)| creds[*ci].0).collect();
+        let bintang_names: Vec<String> = members.iter().map(|(ci, _, _)| creds[*ci].1.clone()).collect();
+        let already_in_use_ids: Vec<Uuid> = members
+            .iter()
+            .filter(|(ci, _, _)| creds[*ci].2.is_some())
+            .map(|(ci, _, _)| creds[*ci].0)
+            .collect();
+        let in_use_court = members.iter().find_map(|(ci, _, _)| creds[*ci].2);
 
         let player_count = bc.current_players.len().clamp(1, 8) as i16;
         let court_type = if bc.current_players.len() == 2 { "half" } else { "full" };
-        let (start_type, start_in_minutes, duration_minutes) = if location == "current" {
+        let (start_type, start_in_minutes, duration_minutes) = if has_current {
             // Playing now → reservation runs out when the board's minutes-left hits 0.
             ("now", 0i16, bc.minutes_left.map(|m| m.clamp(1, 45)).unwrap_or(45))
         } else {
@@ -362,11 +463,11 @@ pub async fn scan_board(
             ("at_time", bc.minutes_left.map(|m| m.clamp(2, 170)).unwrap_or(15), 45)
         };
 
-        matches.push(BoardMatch {
-            credential_id: *cid,
-            bintang_name: name.clone(),
-            already_in_use: in_use_court.is_some(),
-            in_use_court: *in_use_court,
+        out.push(BoardMatch {
+            credential_ids,
+            bintang_names,
+            already_in_use_ids,
+            in_use_court,
             court_number: bc.court_number,
             minutes_left: bc.minutes_left,
             location: location.to_string(),
@@ -380,16 +481,7 @@ pub async fn scan_board(
             duration_minutes,
         });
     }
-
-    let message = if detected == 0 {
-        "Couldn't read the board clearly. Try a closer, straight-on photo — or log courts manually.".to_string()
-    } else if matches.is_empty() {
-        format!("Read {detected} court(s) but none matched a posted login. Post your court logins first, then rescan.")
-    } else {
-        format!("Matched {} of your login(s) across {detected} court(s) on the board.", matches.len())
-    };
-
-    Ok(Json(ApiResponse::ok(BoardScanResult { matches, detected_courts: detected, message })))
+    out
 }
 
 pub async fn complete(
@@ -499,7 +591,8 @@ pub async fn edit(
     Ok(Json(ApiResponse::ok(view)))
 }
 
-/// Force-unlock a credential by detaching it from its active reservation(s).
+/// Force-unlock a credential by detaching it from its active reservation(s) —
+/// both as the primary login and as one of several attached via the board scan.
 pub async fn unlock_credential(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -512,6 +605,16 @@ pub async fn unlock_credential(
     .bind(cred_id)
     .execute(&state.db)
     .await?;
+    // Also detach it where it was attached as a non-primary login on an active
+    // reservation; otherwise the join-table lock would survive the unlock.
+    sqlx::query(
+        "DELETE FROM reservation_credentials rc
+         USING court_reservations cr
+         WHERE rc.credential_id = $1 AND rc.reservation_id = cr.id AND cr.status = 'active'",
+    )
+    .bind(cred_id)
+    .execute(&state.db)
+    .await?;
     state.broadcast(LiveEvent::CredentialsChanged);
     Ok(Json(ApiResponse::message("Credential unlocked.")))
 }
@@ -519,6 +622,11 @@ pub async fn unlock_credential(
 async fn load_one(state: &AppState, id: Uuid) -> Result<Option<ReservationView>, ApiError> {
     let row: Option<ReservationView> = sqlx::query_as(
         "SELECT r.id, r.court_number, r.credential_id, r.credential_name_snapshot AS credential_name,
+                COALESCE(
+                    (SELECT string_agg(rc.name_snapshot, ', ' ORDER BY rc.name_snapshot)
+                     FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
+                    r.credential_name_snapshot
+                ) AS attached_logins,
                 r.reserved_by, u.display_name AS reserved_by_name, r.court_type, r.player_count,
                 r.duration_minutes, r.start_at, r.expiry_at, r.queue_number, r.notes, r.status,
                 r.completed_at, cu.display_name AS completed_by_name, r.created_at
@@ -542,6 +650,84 @@ mod tests {
         let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let start = base + Duration::minutes(start_min);
         ActiveSlot { court, queue, half, start, expiry: start + Duration::minutes(dur_min) }
+    }
+
+    fn court(n: i16, mins: Option<i16>, current: &[&str], queue: &[&str]) -> BoardCourt {
+        BoardCourt {
+            court_number: n,
+            minutes_left: mins,
+            current_players: current.iter().map(|s| s.to_string()).collect(),
+            queue: queue.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn cred(name: &str, in_use: Option<i16>) -> (Uuid, String, Option<i16>) {
+        (Uuid::new_v4(), name.to_string(), in_use)
+    }
+
+    #[test]
+    fn two_logins_on_one_court_make_one_match() {
+        // The reported case: Suchi and Shalu both on Court 22 → one reservation.
+        let creds = vec![cred("Suchi", None), cred("Shalu", None)];
+        let board = vec![court(22, Some(20), &["Suchi", "Shalu", "Vikas", "Anu"], &[])];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 1, "should collapse to a single court reservation");
+        assert_eq!(m[0].court_number, 22);
+        assert_eq!(m[0].credential_ids.len(), 2);
+        assert_eq!(m[0].bintang_names, vec!["Suchi".to_string(), "Shalu".to_string()]);
+        assert_eq!(m[0].location, "current");
+        assert_eq!(m[0].start_type, "now");
+    }
+
+    #[test]
+    fn logins_on_different_courts_make_separate_matches() {
+        let creds = vec![cred("Suchi", None), cred("Shalu", None)];
+        let board = vec![
+            court(22, Some(20), &["Suchi"], &[]),
+            court(17, Some(10), &["Shalu"], &[]),
+        ];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn queued_logins_use_earliest_position_and_one_timer() {
+        // Suchi queue #3, Shalu queue #4 on one court → one queued reservation.
+        let creds = vec![cred("Suchi", None), cred("Shalu", None)];
+        let board = vec![court(22, Some(11), &["A", "B", "C", "D"], &["X", "Y", "Suchi", "Shalu"])];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].location, "queue");
+        assert_eq!(m[0].queue_position, Some(3)); // earliest of #3/#4
+        assert_eq!(m[0].credential_ids.len(), 2);
+    }
+
+    #[test]
+    fn current_match_wins_over_queue_on_same_court() {
+        let creds = vec![cred("Suchi", None), cred("Shalu", None)];
+        let board = vec![court(22, Some(15), &["Suchi"], &["Shalu"])];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].location, "current");
+        assert_eq!(m[0].credential_ids.len(), 2);
+    }
+
+    #[test]
+    fn already_in_use_login_is_flagged_not_dropped() {
+        let creds = vec![cred("Suchi", Some(9)), cred("Shalu", None)];
+        let board = vec![court(22, Some(20), &["Suchi", "Shalu"], &[])];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].already_in_use_ids.len(), 1);
+        assert_eq!(m[0].already_in_use_ids[0], creds[0].0);
+        assert_eq!(m[0].in_use_court, Some(9));
+    }
+
+    #[test]
+    fn unmatched_logins_produce_no_match() {
+        let creds = vec![cred("Zzz", None)];
+        let board = vec![court(22, Some(20), &["Suchi", "Shalu"], &[])];
+        assert!(build_matches(&creds, &board).is_empty());
     }
 
     #[test]
