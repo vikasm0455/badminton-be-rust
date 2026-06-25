@@ -56,7 +56,12 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            tracing::warn!(status = %r.status(), "Claude Vision returned error status");
+            // Log Anthropic's error body (model-not-found, invalid key, low credit,
+            // etc.) so the real reason is visible, not just the status code.
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            let body: String = body.chars().take(600).collect();
+            tracing::warn!(%status, body = %body, "Claude Vision returned error status");
             return empty;
         }
         Err(e) => {
