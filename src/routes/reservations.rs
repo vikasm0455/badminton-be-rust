@@ -546,20 +546,76 @@ pub async fn cancel(
     Ok(Json(ApiResponse::message("Reservation cancelled.")))
 }
 
+/// Three-state field: absent → None (leave as-is), present-null → Some(None)
+/// (clear), present-value → Some(Some(v)). A plain Option<Option<T>> can't tell
+/// absent from null, so we only run this when the key is present.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(de)?))
+}
+
 #[derive(Deserialize)]
 pub struct EditReservationReq {
+    pub court_number: Option<i16>,
+    pub court_type: Option<String>,
+    pub player_count: Option<i16>,
     pub duration_minutes: Option<i16>,
     /// RFC3339.
     pub start_at: Option<String>,
+    /// Absent = leave as-is; null = clear; number = set (1–5).
+    #[serde(default, deserialize_with = "double_option")]
+    pub queue_number: Option<Option<i16>>,
     pub notes: Option<String>,
 }
 
+/// Edit a logged court. Open to any member (like marking complete) so mistakes
+/// can be fixed; each field is optional and only applied when present.
 pub async fn edit(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    _user: AuthUser,
     Path(id): Path<Uuid>,
     Json(req): Json<EditReservationReq>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
+    let dup = || ApiError::Conflict("That court and queue slot already has an active reservation.".into());
+
+    if let Some(c) = req.court_number {
+        if !(1..=53).contains(&c) {
+            return Err(ApiError::BadRequest("Court number must be between 1 and 53.".into()));
+        }
+        match sqlx::query("UPDATE court_reservations SET court_number = $1 WHERE id = $2")
+            .bind(c)
+            .bind(id)
+            .execute(&state.db)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => return Err(dup()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(t) = &req.court_type {
+        if !matches!(t.as_str(), "full" | "half") {
+            return Err(ApiError::BadRequest("court type must be full or half".into()));
+        }
+        sqlx::query("UPDATE court_reservations SET court_type = $1 WHERE id = $2")
+            .bind(t)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
+    if let Some(p) = req.player_count {
+        if !(1..=8).contains(&p) {
+            return Err(ApiError::BadRequest("player count must be between 1 and 8".into()));
+        }
+        sqlx::query("UPDATE court_reservations SET player_count = $1 WHERE id = $2")
+            .bind(p)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
     if let Some(d) = req.duration_minutes {
         if !(1..=180).contains(&d) {
             return Err(ApiError::BadRequest("duration out of range".into()));
@@ -580,9 +636,31 @@ pub async fn edit(
             .execute(&state.db)
             .await?;
     }
+    if let Some(q) = req.queue_number {
+        if let Some(qn) = q {
+            if !(1..=5).contains(&qn) {
+                return Err(ApiError::BadRequest("queue number must be between 1 and 5".into()));
+            }
+        }
+        match sqlx::query("UPDATE court_reservations SET queue_number = $1 WHERE id = $2")
+            .bind(q)
+            .bind(id)
+            .execute(&state.db)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => return Err(dup()),
+            Err(e) => return Err(e.into()),
+        }
+    }
     if let Some(notes) = &req.notes {
+        let n = notes.trim();
+        if n.chars().count() > 100 {
+            return Err(ApiError::BadRequest("notes must be 100 characters or fewer".into()));
+        }
+        let val = if n.is_empty() { None } else { Some(n) };
         sqlx::query("UPDATE court_reservations SET notes = $1 WHERE id = $2")
-            .bind(notes.trim())
+            .bind(val)
             .bind(id)
             .execute(&state.db)
             .await?;
