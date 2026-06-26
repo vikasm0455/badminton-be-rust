@@ -30,7 +30,7 @@ dotenvy = "0.15"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros", "json"] }
 url = "2"
 rand = "0.8"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 web-push = { version = "0.10", default-features = false, features = ["hyper-client"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 base64 = "0.22"
