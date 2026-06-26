@@ -150,8 +150,7 @@ pub struct MemberDetail {
     pub member: MemberRow,
     pub total_votes: i64,
     pub total_attendance: i64,
-    pub kcal_sessions: i64,
-    pub kcal_avg: i64,
+    // kCal is private to each member and intentionally NOT exposed to admins.
 }
 
 pub async fn member_detail(
@@ -178,18 +177,10 @@ pub async fn member_detail(
             .bind(id)
             .fetch_one(&state.db)
             .await?;
-    let (kcal_sessions, kcal_avg): (i64, Option<f64>) =
-        sqlx::query_as("SELECT COUNT(*), AVG(kcal)::float8 FROM kcal_logs WHERE user_id = $1")
-            .bind(id)
-            .fetch_one(&state.db)
-            .await?;
-
     Ok(Json(ApiResponse::ok(MemberDetail {
         member,
         total_votes,
         total_attendance,
-        kcal_sessions,
-        kcal_avg: kcal_avg.unwrap_or(0.0).round() as i64,
     })))
 }
 

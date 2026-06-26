@@ -2,7 +2,6 @@ use axum::Json;
 use axum::extract::State;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
@@ -11,22 +10,15 @@ use crate::state::{AppState, LiveEvent};
 use crate::time;
 
 #[derive(Serialize)]
-pub struct KcalEntry {
-    pub user_id: Uuid,
-    pub display_name: String,
-    pub kcal: i16,
-}
-
-#[derive(Serialize)]
 pub struct MyLog {
     pub kcal: i16,
     pub note: Option<String>,
 }
 
+/// kCal is private to each member — never aggregated or shared. `today` returns
+/// only the caller's own log.
 #[derive(Serialize)]
 pub struct KcalToday {
-    pub entries: Vec<KcalEntry>,
-    pub total: i64,
     pub my_log: Option<MyLog>,
 }
 
@@ -35,19 +27,6 @@ pub async fn today(
     user: AuthUser,
 ) -> Result<Json<ApiResponse<KcalToday>>, ApiError> {
     let game_date = time::today();
-    let entries: Vec<KcalEntry> = sqlx::query_as::<_, (Uuid, String, i16)>(
-        "SELECT k.user_id, u.display_name, k.kcal
-         FROM kcal_logs k JOIN users u ON u.id = k.user_id
-         WHERE k.game_date = $1 ORDER BY k.kcal DESC",
-    )
-    .bind(game_date)
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .map(|(user_id, display_name, kcal)| KcalEntry { user_id, display_name, kcal })
-    .collect();
-
-    let total: i64 = entries.iter().map(|e| e.kcal as i64).sum();
     let my_log = sqlx::query_as::<_, (i16, Option<String>)>(
         "SELECT kcal, note FROM kcal_logs WHERE user_id = $1 AND game_date = $2",
     )
@@ -57,7 +36,7 @@ pub async fn today(
     .await?
     .map(|(kcal, note)| MyLog { kcal, note });
 
-    Ok(Json(ApiResponse::ok(KcalToday { entries, total, my_log })))
+    Ok(Json(ApiResponse::ok(KcalToday { my_log })))
 }
 
 #[derive(Deserialize)]
