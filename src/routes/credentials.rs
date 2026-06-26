@@ -132,9 +132,15 @@ pub async fn post_credential(
 }
 
 #[derive(Serialize)]
-pub struct OcrResult {
+pub struct OcrLogin {
     pub bintang_name: String,
     pub bintang_password: String,
+}
+
+#[derive(Serialize)]
+pub struct OcrResult {
+    /// Every login read from the image (handwritten notes can hold several).
+    pub logins: Vec<OcrLogin>,
     pub ok: bool,
     pub screenshot_path: Option<String>,
     pub message: String,
@@ -164,21 +170,20 @@ pub async fn ocr_credential(
         }
     };
 
-    let outcome = ocr::extract(&state, &bytes, &content_type).await;
-    let message = if outcome.ok {
-        "Review the details below and confirm.".to_string()
-    } else {
-        "Couldn't read the screen clearly — please check and fill in manually.".to_string()
+    let pairs = ocr::extract(&state, &bytes, &content_type).await;
+    let ok = !pairs.is_empty();
+    let message = match pairs.len() {
+        0 => "Couldn't read it clearly — please add the login(s) manually.".to_string(),
+        1 => "Review the login below and confirm.".to_string(),
+        n => format!("Found {n} logins — review and confirm."),
     };
+    let logins = pairs
+        .into_iter()
+        .map(|p| OcrLogin { bintang_name: p.name, bintang_password: p.password })
+        .collect();
     let _ = user; // upload attributed implicitly; auth gate is the point.
 
-    Ok(Json(ApiResponse::ok(OcrResult {
-        bintang_name: outcome.name,
-        bintang_password: outcome.password,
-        ok: outcome.ok,
-        screenshot_path,
-        message,
-    })))
+    Ok(Json(ApiResponse::ok(OcrResult { logins, ok, screenshot_path, message })))
 }
 
 /// Stream a credential's screenshot to authenticated members.

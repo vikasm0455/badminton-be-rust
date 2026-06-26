@@ -8,20 +8,22 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-pub struct OcrOutcome {
+/// One name+password login read from a credential image.
+#[derive(Clone)]
+pub struct OcrPair {
     pub name: String,
     pub password: String,
-    /// true when the model returned at least one field; false → manual fallback.
-    pub ok: bool,
 }
 
-const PROMPT: &str = "This is a photo of a Bintang Badminton kiosk screen. \
-Extract the Name (shown in blue text) and the Password (shown in red text). \
-Respond with ONLY a JSON object, no prose: {\"name\": \"...\", \"password\": \"...\"}. \
-If a field is unreadable, use an empty string for it.";
+const PROMPT: &str = "This image shows one or more Bintang Badminton court logins. \
+A login is a Name and its Password. They may appear as a kiosk screen (Name in blue, Password in red) \
+or as handwriting/notes with each login on its own line, e.g. 'Suchi - lion16' or 'Shalu: bear48'. \
+Extract EVERY login you can read, preserving order. \
+Respond with ONLY a JSON array, no prose: [{\"name\":\"...\",\"password\":\"...\"}]. \
+Use an empty string for an unreadable field. If you cannot read any login, return [].";
 
-pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOutcome {
-    let empty = OcrOutcome { name: String::new(), password: String::new(), ok: false };
+pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> Vec<OcrPair> {
+    let empty: Vec<OcrPair> = Vec::new();
 
     let Some(api_key) = &state.config.anthropic_api_key else {
         tracing::info!("ANTHROPIC_API_KEY not set — OCR skipped, manual entry");
@@ -33,7 +35,7 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
 
     let body = json!({
         "model": state.config.anthropic_model,
-        "max_tokens": 256,
+        "max_tokens": 512, // room for several name/password pairs
         "messages": [{
             "role": "user",
             "content": [
@@ -86,12 +88,22 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> OcrOut
         .and_then(|t| t.as_str())
         .unwrap_or("");
 
-    let parsed: serde_json::Value = serde_json::from_str(extract_json(text)).unwrap_or(json!({}));
-    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let password = parsed.get("password").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    parse_logins(text)
+}
 
-    let ok = !name.is_empty() || !password.is_empty();
-    OcrOutcome { name, password, ok }
+/// Parse the model's JSON array of {name, password} logins, dropping blank rows.
+fn parse_logins(text: &str) -> Vec<OcrPair> {
+    let arr: serde_json::Value = serde_json::from_str(extract_json_array(text)).unwrap_or(json!([]));
+    let Some(items) = arr.as_array() else { return Vec::new() };
+    let mut out = Vec::new();
+    for it in items {
+        let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let password = it.get("password").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if !name.is_empty() || !password.is_empty() {
+            out.push(OcrPair { name, password });
+        }
+    }
+    out
 }
 
 /// Downscale + JPEG-encode an image so it always fits Claude Vision's limits
@@ -121,16 +133,6 @@ fn prepare_image(bytes: &[u8], media_type: &str) -> (Vec<u8>, String) {
         }
     }
     (buf, "image/jpeg".to_string())
-}
-
-/// Pull the first {...} block out of a possibly-fenced response.
-fn extract_json(s: &str) -> &str {
-    let start = s.find('{');
-    let end = s.rfind('}');
-    match (start, end) {
-        (Some(a), Some(b)) if b > a => &s[a..=b],
-        _ => "{}",
-    }
 }
 
 // ---- court status board OCR -------------------------------------------------
