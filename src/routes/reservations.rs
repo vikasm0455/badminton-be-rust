@@ -426,6 +426,9 @@ fn build_matches(creds: &[(Uuid, String, Option<i16>)], board: &[BoardCourt]) ->
         })
         .collect();
 
+    // A doubles game seats at most 4; never suggest a larger "group".
+    const MAX_PLAYERS: usize = 4;
+
     let mut out = Vec::new();
     for (bi, bc) in board.iter().enumerate() {
         // Every login that resolved to this court panel.
@@ -438,48 +441,57 @@ fn build_matches(creds: &[(Uuid, String, Option<i16>)], board: &[BoardCourt]) ->
             continue;
         }
 
-        let has_current = members.iter().any(|(_, cur, _)| *cur);
-        let min_qpos = members.iter().filter_map(|(_, _, qp)| *qp).min();
-        let location = if has_current { "current" } else { "queue" };
-        let queue_position = if has_current { None } else { min_qpos.map(|p| p.clamp(1, 5)) };
+        // Playing-now and queued logins are DIFFERENT groups (different people,
+        // different time slots) — emit a separate reservation for each instead of
+        // merging them into one oversized booking.
+        for is_current in [true, false] {
+            let group: Vec<(usize, Option<i16>)> = members
+                .iter()
+                .filter(|(_, cur, _)| *cur == is_current)
+                .map(|(ci, _, qp)| (*ci, *qp))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
 
-        let credential_ids: Vec<Uuid> = members.iter().map(|(ci, _, _)| creds[*ci].0).collect();
-        let bintang_names: Vec<String> = members.iter().map(|(ci, _, _)| creds[*ci].1.clone()).collect();
-        let already_in_use_ids: Vec<Uuid> = members
-            .iter()
-            .filter(|(ci, _, _)| creds[*ci].2.is_some())
-            .map(|(ci, _, _)| creds[*ci].0)
-            .collect();
-        let in_use_court = members.iter().find_map(|(ci, _, _)| creds[*ci].2);
+            let credential_ids: Vec<Uuid> = group.iter().map(|(ci, _)| creds[*ci].0).collect();
+            let bintang_names: Vec<String> = group.iter().map(|(ci, _)| creds[*ci].1.clone()).collect();
+            let already_in_use_ids: Vec<Uuid> = group
+                .iter()
+                .filter(|(ci, _)| creds[*ci].2.is_some())
+                .map(|(ci, _)| creds[*ci].0)
+                .collect();
+            let in_use_court = group.iter().find_map(|(ci, _)| creds[*ci].2);
+            let player_count = group.len().clamp(1, MAX_PLAYERS) as i16;
 
-        let player_count = bc.current_players.len().clamp(1, 8) as i16;
-        let court_type = if bc.current_players.len() == 2 { "half" } else { "full" };
-        let (start_type, start_in_minutes, duration_minutes) = if has_current {
-            // Playing now → reservation runs out when the board's minutes-left hits 0.
-            ("now", 0i16, bc.minutes_left.map(|m| m.clamp(1, 45)).unwrap_or(45))
-        } else {
-            // Queued → starts when the current group frees the court (minutes-left),
-            // then runs a standard 45-minute group-play slot.
-            ("at_time", bc.minutes_left.map(|m| m.clamp(2, 170)).unwrap_or(15), 45)
-        };
+            let (location, queue_position, start_type, start_in_minutes, duration_minutes) = if is_current {
+                // Playing now → runs out when the board's minutes-left hits 0.
+                ("current", None, "now", 0i16, bc.minutes_left.map(|m| m.clamp(1, 45)).unwrap_or(45))
+            } else {
+                // Queued → starts when the current group frees the court, then a
+                // standard 45-minute slot. Use the earliest matched queue position.
+                let qpos = group.iter().filter_map(|(_, qp)| *qp).min().map(|p| p.clamp(1, 5));
+                ("queue", qpos, "at_time", bc.minutes_left.map(|m| m.clamp(2, 170)).unwrap_or(15), 45)
+            };
 
-        out.push(BoardMatch {
-            credential_ids,
-            bintang_names,
-            already_in_use_ids,
-            in_use_court,
-            court_number: bc.court_number,
-            minutes_left: bc.minutes_left,
-            location: location.to_string(),
-            queue_position,
-            current_players: bc.current_players.clone(),
-            queue: bc.queue.clone(),
-            player_count,
-            court_type: court_type.to_string(),
-            start_type: start_type.to_string(),
-            start_in_minutes,
-            duration_minutes,
-        });
+            out.push(BoardMatch {
+                credential_ids,
+                bintang_names,
+                already_in_use_ids,
+                in_use_court,
+                court_number: bc.court_number,
+                minutes_left: bc.minutes_left,
+                location: location.to_string(),
+                queue_position,
+                current_players: bc.current_players.clone(),
+                queue: bc.queue.clone(),
+                player_count,
+                court_type: "full".to_string(),
+                start_type: start_type.to_string(),
+                start_in_minutes,
+                duration_minutes,
+            });
+        }
     }
     out
 }
@@ -703,13 +715,54 @@ mod tests {
     }
 
     #[test]
-    fn current_match_wins_over_queue_on_same_court() {
+    fn current_and_queue_on_same_court_are_separate_reservations() {
+        // Playing-now and queued are different groups → two reservations, not one.
         let creds = vec![cred("Suchi", None), cred("Shalu", None)];
         let board = vec![court(22, Some(15), &["Suchi"], &["Shalu"])];
         let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 2);
+        let cur = m.iter().find(|x| x.location == "current").unwrap();
+        let q = m.iter().find(|x| x.location == "queue").unwrap();
+        assert_eq!(cur.bintang_names, vec!["Suchi".to_string()]);
+        assert_eq!(q.bintang_names, vec!["Shalu".to_string()]);
+    }
+
+    #[test]
+    fn playing_now_and_queue_split_with_capped_player_count() {
+        // The reported bug: Court 31 had 4 playing now + 2 queued, all group
+        // logins — must NOT merge into one 6-player reservation.
+        let creds = vec![
+            cred("Hdd", None),
+            cred("Jujub", None),
+            cred("Sharan", None),
+            cred("Vikam", None),
+            cred("Suchi", None),
+            cred("Shalu", None),
+        ];
+        let board = vec![court(31, Some(42), &["Hdd", "Jujub", "Sharan", "Vikam"], &["Suchi", "Shalu"])];
+        let m = build_matches(&creds, &board);
+        assert_eq!(m.len(), 2, "playing-now and queued must be separate reservations");
+        let cur = m.iter().find(|x| x.location == "current").unwrap();
+        let q = m.iter().find(|x| x.location == "queue").unwrap();
+        assert_eq!(cur.player_count, 4);
+        assert_eq!(cur.credential_ids.len(), 4);
+        assert_eq!(q.player_count, 2);
+        assert_eq!(q.queue_position, Some(1));
+    }
+
+    #[test]
+    fn player_count_never_exceeds_four() {
+        let creds = vec![
+            cred("Aaa", None),
+            cred("Bbb", None),
+            cred("Ccc", None),
+            cred("Ddd", None),
+            cred("Eee", None),
+        ];
+        let board = vec![court(5, Some(20), &["Aaa", "Bbb", "Ccc", "Ddd", "Eee"], &[])];
+        let m = build_matches(&creds, &board);
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].location, "current");
-        assert_eq!(m[0].credential_ids.len(), 2);
+        assert_eq!(m[0].player_count, 4);
     }
 
     #[test]
