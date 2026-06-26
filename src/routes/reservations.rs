@@ -21,6 +21,9 @@ pub struct ReservationView {
     /// group on one court). Falls back to credential_name for legacy rows.
     #[sqlx(default)]
     pub attached_logins: Option<String>,
+    /// IDs of every login attached to this reservation (for the edit form).
+    #[sqlx(default)]
+    pub attached_credential_ids: Vec<Uuid>,
     pub reserved_by: Uuid,
     pub reserved_by_name: String,
     pub court_type: String,
@@ -72,6 +75,10 @@ pub async fn today(
                      FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
                     r.credential_name_snapshot
                 ) AS attached_logins,
+                COALESCE(
+                    (SELECT array_agg(rc.credential_id) FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
+                    ARRAY[]::uuid[]
+                ) AS attached_credential_ids,
                 r.reserved_by, u.display_name AS reserved_by_name, r.court_type, r.player_count,
                 r.duration_minutes, r.start_at, r.expiry_at, r.queue_number, r.notes, r.status,
                 r.completed_at, cu.display_name AS completed_by_name, r.created_at
@@ -569,6 +576,10 @@ pub struct EditReservationReq {
     #[serde(default, deserialize_with = "double_option")]
     pub queue_number: Option<Option<i16>>,
     pub notes: Option<String>,
+    /// Absent = leave logins as-is; otherwise set the attached logins to exactly
+    /// this list (empty = detach all). Each must be free or already on this court.
+    #[serde(default)]
+    pub credential_ids: Option<Vec<Uuid>>,
 }
 
 /// Edit a logged court. Open to any member (like marking complete) so mistakes
@@ -665,6 +676,65 @@ pub async fn edit(
             .execute(&state.db)
             .await?;
     }
+    // Re-sync the attached logins to exactly the requested set. Each login must
+    // be free or already on THIS court (lock check excludes this reservation).
+    if let Some(raw) = &req.credential_ids {
+        let mut new_ids: Vec<Uuid> = Vec::new();
+        for cid in raw {
+            if !new_ids.contains(cid) {
+                new_ids.push(*cid);
+            }
+        }
+        let mut resolved: Vec<(Uuid, String)> = Vec::new();
+        for cid in &new_ids {
+            let cred: Option<(String, chrono::NaiveDate)> =
+                sqlx::query_as("SELECT bintang_name, game_date FROM court_credentials WHERE id = $1")
+                    .bind(cid)
+                    .fetch_optional(&state.db)
+                    .await?;
+            let (name, gdate) = cred.ok_or_else(|| ApiError::BadRequest("credential not found".into()))?;
+            if gdate != time::today() {
+                return Err(ApiError::BadRequest("that credential is not for today".into()));
+            }
+            let locked: Option<(i16,)> = sqlx::query_as(
+                "SELECT cr.court_number FROM court_reservations cr
+                 WHERE cr.status = 'active' AND cr.expiry_at > NOW() AND cr.id <> $2
+                   AND (cr.credential_id = $1
+                        OR EXISTS (SELECT 1 FROM reservation_credentials rc
+                                   WHERE rc.reservation_id = cr.id AND rc.credential_id = $1))
+                 LIMIT 1",
+            )
+            .bind(cid)
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+            if let Some((court,)) = locked {
+                return Err(ApiError::Conflict(format!("{name}'s login is in use — Court {court}.")));
+            }
+            resolved.push((*cid, name));
+        }
+        let mut tx = state.db.begin().await?;
+        sqlx::query("DELETE FROM reservation_credentials WHERE reservation_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for (cid, name) in &resolved {
+            sqlx::query("INSERT INTO reservation_credentials (reservation_id, credential_id, name_snapshot) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(cid)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Mirror the primary login onto the row for legacy/display fields.
+        sqlx::query("UPDATE court_reservations SET credential_id = $1, credential_name_snapshot = $2 WHERE id = $3")
+            .bind(resolved.first().map(|(c, _)| *c))
+            .bind(resolved.first().map(|(_, n)| n.clone()))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
     // Keep expiry_at consistent if duration/start changed (make_interval is immutable).
     if req.duration_minutes.is_some() || req.start_at.is_some() {
         sqlx::query(
@@ -717,6 +787,10 @@ async fn load_one(state: &AppState, id: Uuid) -> Result<Option<ReservationView>,
                      FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
                     r.credential_name_snapshot
                 ) AS attached_logins,
+                COALESCE(
+                    (SELECT array_agg(rc.credential_id) FROM reservation_credentials rc WHERE rc.reservation_id = r.id),
+                    ARRAY[]::uuid[]
+                ) AS attached_credential_ids,
                 r.reserved_by, u.display_name AS reserved_by_name, r.court_type, r.player_count,
                 r.duration_minutes, r.start_at, r.expiry_at, r.queue_number, r.notes, r.status,
                 r.completed_at, cu.display_name AS completed_by_name, r.created_at
