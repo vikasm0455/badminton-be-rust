@@ -39,7 +39,7 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Observability (Prometheus /metrics, mirrors rust-be-app)
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
 
 # Server-side image downscaling before Claude Vision OCR (keeps uploads within
