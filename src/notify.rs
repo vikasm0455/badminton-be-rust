@@ -169,6 +169,8 @@ pub fn operator_alert(state: &AppState, text: &str) {
     );
 }
 
+// LEGACY-SINGLE-TENANT: member_approved/member_rejected serve the dead
+// admin-approval flow — delete with admin.rs approve/reject.
 pub fn member_approved(state: &AppState, user_id: Uuid) {
     notify_user(
         state,

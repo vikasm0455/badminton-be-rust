@@ -236,6 +236,8 @@ pub async fn clear_account_lock(state: &AppState, email: &str) {
 }
 
 /// Invite-code attempt limiter (PRD §4.3: 10 per IP per hour).
+// LEGACY-SINGLE-TENANT: no callers since invite codes were replaced by group email
+// invites — delete with the invite-code system.
 pub async fn check_invite_attempt(state: &AppState, ip: IpAddr) -> Result<(), ApiError> {
     let (ok, _retry) = sliding_window(
         state,

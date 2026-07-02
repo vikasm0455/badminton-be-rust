@@ -63,6 +63,46 @@ creation (old code inserts polls without group_id — allowed, column is
 nullable) and per-date poll uniqueness (relaxed to per-group). Practical
 rollback: restore the previous image; don't drop the new tables.
 
+## Post-release cleanup (after the groups release is stable)
+
+Every piece of code made obsolete by multi-tenancy is tagged with a single
+grep-able marker. To find it all:
+
+```bash
+grep -rn "LEGACY-SINGLE-TENANT" badminton-be-rust/src badminton-fe/src
+```
+
+Safe to delete once the release has been stable for a while (say a month):
+
+| What | Where |
+|---|---|
+| approve/reject member handlers + routes | `admin.rs`, `lib.rs` |
+| invite-CODE handlers + routes + `InviteRow` | `admin.rs`, `lib.rs` |
+| `notify::member_approved` / `member_rejected` | `notify.rs` |
+| `email::send_approved` / `send_rejected` | `email.rs` |
+| `otp::check_invite_attempt` | `otp.rs` |
+| unused security consts (`INVITE_USED`, `INVALID_INVITE_ATTEMPT`, `MEMBER_APPROVED/REJECTED`) | `security.rs` — delete with the handlers |
+| FE `/admin/invites` page + `InviteRow` type | `app/admin/invites/`, `lib/types.ts` |
+| FE `/pending` page + its redirects | `app/pending/`, `login/page.tsx`, `(app)/layout.tsx` |
+| FE `/join` redirect stub | `app/join/` — keep while old invite links circulate |
+
+Database leftovers go in a **new** migration (e.g. `0004_drop_legacy.sql`):
+
+```sql
+DROP TABLE IF EXISTS invite_codes;
+DELETE FROM app_config WHERE key IN
+  ('auto_poll_enabled','auto_poll_time','auto_poll_note','auto_poll_final_reminder_time');
+```
+
+### ⚠️ What must NEVER be deleted
+
+**Applied migration files** (`0001`–`0003`) are permanent. sqlx records each
+applied migration with a checksum in `_sqlx_migrations`; if a recorded file is
+missing or edited, the API refuses to boot (`VersionMissing`/`VersionMismatch`).
+The migration runs only once ever — an already-applied file costs nothing to
+keep. All schema removal happens through NEW migrations, never by touching old
+ones.
+
 ## New env (optional)
 
 `APP_BASE_URL` — public URL used in invite emails

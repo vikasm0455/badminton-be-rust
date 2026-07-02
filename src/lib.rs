@@ -117,6 +117,8 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         // ---- admin ---------------------------------------------------------
         .route("/api/admin/members", get(routes::admin::list_members))
         .route("/api/admin/members/:id", get(routes::admin::member_detail))
+        // LEGACY-SINGLE-TENANT: approve/reject + invite-code routes below are dead
+        // under open signup / group invites — delete with their handlers.
         .route("/api/admin/members/:id/approve", post(routes::admin::approve_member))
         .route("/api/admin/members/:id/reject", post(routes::admin::reject_member))
         .route("/api/admin/members/:id/deactivate", post(routes::admin::deactivate_member))

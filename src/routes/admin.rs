@@ -53,6 +53,11 @@ async fn fetch_user(state: &AppState, id: Uuid) -> Result<(String, String, Strin
     .ok_or(ApiError::NotFound)
 }
 
+// LEGACY-SINGLE-TENANT: approve/reject existed for the invite-code + admin-approval
+// flow. Open signup means no user is ever 'pending' anymore, so these two handlers
+// (plus their lib.rs routes, notify::member_approved/rejected, and
+// email::send_approved/send_rejected) are dead and safe to delete once the groups
+// release is stable. See docs/MIGRATION-0003-groups.md § Post-release cleanup.
 pub async fn approve_member(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -201,6 +206,12 @@ pub struct InviteRow {
     pub computed_status: String,
 }
 
+// LEGACY-SINGLE-TENANT: the invite-CODE system (invite_codes table) is replaced by
+// per-group email invites (routes/groups.rs). list/generate/revoke below, their
+// lib.rs routes, the InviteRow struct above, otp::check_invite_attempt, the FE page
+// app/admin/invites, and eventually the invite_codes table (via a future migration —
+// never edit applied migration files) are safe to delete once the groups release is
+// stable. See docs/MIGRATION-0003-groups.md § Post-release cleanup.
 pub async fn list_invites(
     State(state): State<AppState>,
     _admin: AdminUser,

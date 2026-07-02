@@ -72,6 +72,7 @@ pub async fn send_group_invite(
     .await
 }
 
+// LEGACY-SINGLE-TENANT: only used by the dead approve/reject flow — delete with it.
 pub async fn send_approved(state: &AppState, to: &str, name: &str) -> Result<(), ApiError> {
     send_email(
         state,
@@ -82,6 +83,7 @@ pub async fn send_approved(state: &AppState, to: &str, name: &str) -> Result<(),
     .await
 }
 
+// LEGACY-SINGLE-TENANT: only used by the dead approve/reject flow — delete with it.
 pub async fn send_rejected(state: &AppState, to: &str, name: &str) -> Result<(), ApiError> {
     send_email(
         state,
