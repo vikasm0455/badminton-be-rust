@@ -1,10 +1,11 @@
 //! High-level notification triggers (PRD §8.3 text + §8.4 batching). Wraps the
-//! low-level `push` fan-out with the exact copy and category routing.
+//! low-level `push` fan-out with the exact copy and category routing. All
+//! gameplay notifications are scoped to the GROUP they happened in.
 
 use redis::AsyncCommands;
 use uuid::Uuid;
 
-use crate::push::{PushPayload, notify_admins, notify_all, notify_user};
+use crate::push::{PushPayload, notify_admins, notify_group, notify_groups, notify_user};
 use crate::state::AppState;
 
 /// notif_prefs categories (opt-out: absent key = enabled).
@@ -14,11 +15,12 @@ pub mod cat {
     pub const CREDENTIALS: &str = "credentials";
     pub const RESERVATIONS: &str = "reservations";
     pub const TIMERS: &str = "timers";
+    #[allow(dead_code)]
     pub const ADMIN: &str = "admin";
     pub const ACCOUNT: &str = "account";
 }
 
-pub fn poll_created(state: &AppState, creator: Option<Uuid>, by_name: &str, time: &str, auto: bool) {
+pub fn poll_created(state: &AppState, group_id: Uuid, creator: Option<Uuid>, by_name: &str, time: &str, auto: bool) {
     let payload = if auto {
         PushPayload::new(
             "🏸 Today's badminton poll is live",
@@ -34,12 +36,14 @@ pub fn poll_created(state: &AppState, creator: Option<Uuid>, by_name: &str, time
             "poll",
         )
     };
-    notify_all(state, payload, creator, cat::POLLS);
+    notify_group(state, group_id, payload, creator, cat::POLLS);
 }
 
-pub fn credential_posted(state: &AppState, poster: Uuid, by_name: &str) {
-    notify_all(
+/// A login was posted and shared with these groups.
+pub fn credential_posted(state: &AppState, group_ids: Vec<Uuid>, poster: Uuid, by_name: &str) {
+    notify_groups(
         state,
+        group_ids,
         PushPayload::new(
             "🔑 New court login posted",
             format!("{by_name} posted today's court login — tap to view"),
@@ -53,6 +57,7 @@ pub fn credential_posted(state: &AppState, poster: Uuid, by_name: &str) {
 
 pub fn reservation_logged(
     state: &AppState,
+    group_id: Uuid,
     actor: Uuid,
     by_name: &str,
     court: i16,
@@ -73,12 +78,13 @@ pub fn reservation_logged(
             "court",
         ),
     };
-    notify_all(state, payload, Some(actor), cat::RESERVATIONS);
+    notify_group(state, group_id, payload, Some(actor), cat::RESERVATIONS);
 }
 
-pub fn reservation_complete(state: &AppState, actor: Uuid, court: i16, by_name: &str) {
-    notify_all(
+pub fn reservation_complete(state: &AppState, group_id: Uuid, actor: Uuid, court: i16, by_name: &str) {
+    notify_group(
         state,
+        group_id,
         PushPayload::new(
             "✅ Court complete",
             format!("Court {court} marked complete by {by_name}"),
@@ -91,7 +97,7 @@ pub fn reservation_complete(state: &AppState, actor: Uuid, court: i16, by_name: 
 }
 
 /// Timer threshold notifications are never batched (time-critical, PRD §8.4).
-pub fn timer_threshold(state: &AppState, court: i16, threshold: i32) {
+pub fn timer_threshold(state: &AppState, group_id: Uuid, court: i16, threshold: i32) {
     let (title, body) = match threshold {
         15 => ("⏳ 15 minutes left", format!("Court {court} has 15 min left — time to re-book!")),
         10 => ("⏳ 10 minutes left", format!("Court {court} — 10 minutes left")),
@@ -99,17 +105,19 @@ pub fn timer_threshold(state: &AppState, court: i16, threshold: i32) {
         0 => ("🏸 Session ended", format!("Court {court} session has ended")),
         _ => ("⏳ Court timer", format!("Court {court} timer update")),
     };
-    notify_all(
+    notify_group(
         state,
+        group_id,
         PushPayload::new(title, body, "/courts", format!("court-{court}-timer")),
         None,
         cat::TIMERS,
     );
 }
 
-pub fn prestart(state: &AppState, court: i16) {
-    notify_all(
+pub fn prestart(state: &AppState, group_id: Uuid, court: i16) {
+    notify_group(
         state,
+        group_id,
         PushPayload::new(
             "⏰ Court starts in 5 minutes",
             format!("Court {court} starts in 5 minutes — head over!"),
@@ -121,9 +129,27 @@ pub fn prestart(state: &AppState, court: i16) {
     );
 }
 
-pub fn credentials_cleared(state: &AppState) {
-    notify_all(
+/// Day-of nudge when a poll is still short on Yes votes (PRD §21 Q4).
+pub fn final_reminder(state: &AppState, group_id: Uuid, yes_count: i64) {
+    notify_group(
         state,
+        group_id,
+        PushPayload::new(
+            "🏸 Playing tonight?",
+            format!("Only {yes_count} Yes so far — vote so the group can plan!"),
+            "/home",
+            "poll-reminder",
+        ),
+        None,
+        cat::POLLS,
+    );
+}
+
+/// Nightly clear notice, sent to each group that had logins shared today.
+pub fn credentials_cleared(state: &AppState, group_ids: Vec<Uuid>) {
+    notify_groups(
+        state,
+        group_ids,
         PushPayload::new(
             "🌙 Credentials cleared",
             "Today's credentials cleared. See you tomorrow!",
@@ -135,15 +161,11 @@ pub fn credentials_cleared(state: &AppState) {
     );
 }
 
-pub fn signup_request(state: &AppState, name: &str) {
+/// Site-operator alert (e.g. an account got locked out).
+pub fn operator_alert(state: &AppState, text: &str) {
     notify_admins(
         state,
-        PushPayload::new(
-            "👤 New member request",
-            format!("{name} wants to join — review in admin panel"),
-            "/admin/members",
-            "signup",
-        ),
+        PushPayload::new("⚠️ RallyUp alert", text.to_string(), "/admin/security", "operator"),
     );
 }
 
@@ -180,13 +202,13 @@ pub fn member_rejected(state: &AppState, user_id: Uuid) {
 /// The first Yes-voter in a window fires an immediate notification and opens
 /// the window; subsequent voters are queued and flushed as one digest when the
 /// window closes.
-pub fn vote_yes(state: &AppState, poll_id: Uuid, voter_name: &str, yes_count: i64) {
+pub fn vote_yes(state: &AppState, group_id: Uuid, poll_id: Uuid, voter_name: &str, yes_count: i64) {
     let state = state.clone();
     let voter_name = voter_name.to_string();
     tokio::spawn(async move {
         let Some(mut r) = state.redis.clone() else {
             // No Redis → no batching state; just send immediately.
-            send_vote_push(&state, &format!("{voter_name} voted Yes"), yes_count);
+            send_vote_push(&state, group_id, &format!("{voter_name} voted Yes"), yes_count);
             return;
         };
 
@@ -205,12 +227,12 @@ pub fn vote_yes(state: &AppState, poll_id: Uuid, voter_name: &str, yes_count: i6
         let first = set_res.map(|res| res.is_some()).unwrap_or(true);
 
         if first {
-            send_vote_push(&state, &format!("{voter_name} voted Yes"), yes_count);
+            send_vote_push(&state, group_id, &format!("{voter_name} voted Yes"), yes_count);
             // Open the digest timer.
             let state2 = state.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-                flush_vote_digest(&state2, poll_id).await;
+                flush_vote_digest(&state2, group_id, poll_id).await;
             });
         } else {
             let _: Result<(), _> = r.rpush(&pending_key, &voter_name).await;
@@ -219,7 +241,7 @@ pub fn vote_yes(state: &AppState, poll_id: Uuid, voter_name: &str, yes_count: i6
     });
 }
 
-async fn flush_vote_digest(state: &AppState, poll_id: Uuid) {
+async fn flush_vote_digest(state: &AppState, group_id: Uuid, poll_id: Uuid) {
     let Some(mut r) = state.redis.clone() else { return };
     let pending_key = format!("vote_batch_names:{poll_id}");
     let names: Vec<String> = r.lrange(&pending_key, 0, -1).await.unwrap_or_default();
@@ -245,12 +267,13 @@ async fn flush_vote_digest(state: &AppState, poll_id: Uuid) {
             n - 2
         ),
     };
-    send_vote_push(state, &body, yes_count);
+    send_vote_push(state, group_id, &body, yes_count);
 }
 
-fn send_vote_push(state: &AppState, body: &str, yes_count: i64) {
-    notify_all(
+fn send_vote_push(state: &AppState, group_id: Uuid, body: &str, yes_count: i64) {
+    notify_group(
         state,
+        group_id,
         PushPayload::new(
             format!("🏸 {yes_count} Yes for tonight"),
             body.to_string(),

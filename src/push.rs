@@ -115,20 +115,27 @@ struct SubRow {
     auth: String,
 }
 
-/// Send to all active members; `exclude` skips one user (e.g. the actor).
-/// `category` is checked against each user's notif_prefs (opt-out model).
-pub fn notify_all(state: &AppState, payload: PushPayload, exclude: Option<Uuid>, category: &str) {
+/// Send to every member of the given groups (deduped across groups); `exclude`
+/// skips one user (e.g. the actor). `category` is checked against each user's
+/// notif_prefs (opt-out model).
+pub fn notify_groups(state: &AppState, group_ids: Vec<Uuid>, payload: PushPayload, exclude: Option<Uuid>, category: &str) {
+    if group_ids.is_empty() {
+        return;
+    }
     let state = state.clone();
     let category = category.to_string();
     tokio::spawn(async move {
         let subs: Vec<SubRow> = sqlx::query_as(
-            "SELECT ps.id, ps.endpoint, ps.p256dh, ps.auth
+            "SELECT DISTINCT ps.id, ps.endpoint, ps.p256dh, ps.auth
              FROM push_subscriptions ps
              JOIN users u ON u.id = ps.user_id
+             JOIN group_members gm ON gm.user_id = ps.user_id
              WHERE ps.active = true AND u.status = 'active'
-               AND ($1::uuid IS NULL OR ps.user_id <> $1)
-               AND COALESCE((u.notif_prefs ->> $2)::boolean, true) = true",
+               AND gm.group_id = ANY($1)
+               AND ($2::uuid IS NULL OR ps.user_id <> $2)
+               AND COALESCE((u.notif_prefs ->> $3)::boolean, true) = true",
         )
+        .bind(&group_ids)
         .bind(exclude)
         .bind(&category)
         .fetch_all(&state.db)
@@ -136,6 +143,11 @@ pub fn notify_all(state: &AppState, payload: PushPayload, exclude: Option<Uuid>,
         .unwrap_or_default();
         deliver(&state, subs, &payload).await;
     });
+}
+
+/// Convenience: notify a single group.
+pub fn notify_group(state: &AppState, group_id: Uuid, payload: PushPayload, exclude: Option<Uuid>, category: &str) {
+    notify_groups(state, vec![group_id], payload, exclude, category);
 }
 
 /// Send to one specific user's devices.

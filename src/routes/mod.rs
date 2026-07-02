@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod credentials;
+pub mod groups;
 pub mod health;
 pub mod kcal;
 pub mod polls;

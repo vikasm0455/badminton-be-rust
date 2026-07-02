@@ -30,6 +30,8 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// When set, `/metrics` requires `Authorization: Bearer <token>` (404 otherwise).
     pub metrics_token: Option<String>,
+    /// Public URL of the app, used in invite emails (e.g. "https://rally-up.example.com").
+    pub app_base_url: Option<String>,
     pub port: u16,
 }
 
@@ -103,6 +105,10 @@ impl Config {
         };
 
         let metrics_token = env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty());
+        let app_base_url = env::var("APP_BASE_URL")
+            .ok()
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
 
         let port = env::var("PORT")
             .ok()
@@ -124,6 +130,7 @@ impl Config {
             cookie_secure,
             allowed_origins,
             metrics_token,
+            app_base_url,
             port,
         })
     }

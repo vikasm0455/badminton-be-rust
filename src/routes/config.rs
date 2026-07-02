@@ -1,13 +1,16 @@
-//! Auto-poll configuration (PRD §5.1.2, stored in app_config). Readable by any
-//! member (so Settings can show current state); only admins can change it.
+//! Auto-poll configuration (PRD §5.1.2) — per GROUP. Readable by any member of
+//! the active group (so Settings can show current state); only group admins can
+//! change it.
 
 use axum::Json;
 use axum::extract::State;
+use chrono::NaiveTime;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AdminUser, AuthUser};
+use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::models::ApiResponse;
+use crate::routes::groups::{active_group, require_group_admin};
 use crate::state::AppState;
 use crate::time;
 
@@ -19,38 +22,23 @@ pub struct AutoPollConfig {
     pub final_reminder_time: String,
 }
 
-async fn read(state: &AppState, key: &str, default: &str) -> String {
-    sqlx::query_as::<_, (String,)>("SELECT value FROM app_config WHERE key = $1")
-        .bind(key)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| r.0)
-        .unwrap_or_else(|| default.to_string())
-}
-
-async fn write(state: &AppState, key: &str, value: &str) -> Result<(), ApiError> {
-    sqlx::query(
-        "INSERT INTO app_config (key, value, updated_at) VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-    )
-    .bind(key)
-    .bind(value)
-    .execute(&state.db)
-    .await?;
-    Ok(())
-}
-
 pub async fn get_auto_poll(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Json<ApiResponse<AutoPollConfig>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
+    let row: (bool, NaiveTime, String, NaiveTime) = sqlx::query_as(
+        "SELECT auto_poll_enabled, auto_poll_time, auto_poll_note, final_reminder_time
+         FROM groups WHERE id = $1",
+    )
+    .bind(ctx.group_id)
+    .fetch_one(&state.db)
+    .await?;
     Ok(Json(ApiResponse::ok(AutoPollConfig {
-        enabled: read(&state, "auto_poll_enabled", "true").await == "true",
-        time: read(&state, "auto_poll_time", "10:00").await,
-        note: read(&state, "auto_poll_note", "").await,
-        final_reminder_time: read(&state, "auto_poll_final_reminder_time", "17:00").await,
+        enabled: row.0,
+        time: row.1.format("%H:%M").to_string(),
+        note: row.2,
+        final_reminder_time: row.3.format("%H:%M").to_string(),
     })))
 }
 
@@ -64,25 +52,42 @@ pub struct UpdateAutoPollReq {
 
 pub async fn set_auto_poll(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    user: AuthUser,
     Json(req): Json<UpdateAutoPollReq>,
 ) -> Result<Json<ApiResponse<AutoPollConfig>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
     if let Some(enabled) = req.enabled {
-        write(&state, "auto_poll_enabled", if enabled { "true" } else { "false" }).await?;
+        sqlx::query("UPDATE groups SET auto_poll_enabled = $1 WHERE id = $2")
+            .bind(enabled)
+            .bind(ctx.group_id)
+            .execute(&state.db)
+            .await?;
     }
     if let Some(t) = &req.time {
-        time::parse_hhmm(t).ok_or_else(|| ApiError::BadRequest("invalid time (HH:MM)".into()))?;
-        write(&state, "auto_poll_time", t.trim()).await?;
+        let parsed = time::parse_hhmm(t).ok_or_else(|| ApiError::BadRequest("invalid time (HH:MM)".into()))?;
+        sqlx::query("UPDATE groups SET auto_poll_time = $1 WHERE id = $2")
+            .bind(parsed)
+            .bind(ctx.group_id)
+            .execute(&state.db)
+            .await?;
     }
     if let Some(t) = &req.final_reminder_time {
-        time::parse_hhmm(t).ok_or_else(|| ApiError::BadRequest("invalid time (HH:MM)".into()))?;
-        write(&state, "auto_poll_final_reminder_time", t.trim()).await?;
+        let parsed = time::parse_hhmm(t).ok_or_else(|| ApiError::BadRequest("invalid time (HH:MM)".into()))?;
+        sqlx::query("UPDATE groups SET final_reminder_time = $1 WHERE id = $2")
+            .bind(parsed)
+            .bind(ctx.group_id)
+            .execute(&state.db)
+            .await?;
     }
     if let Some(note) = &req.note {
         if note.chars().count() > 120 {
             return Err(ApiError::BadRequest("note too long".into()));
         }
-        write(&state, "auto_poll_note", note.trim()).await?;
+        sqlx::query("UPDATE groups SET auto_poll_note = $1 WHERE id = $2")
+            .bind(note.trim())
+            .bind(ctx.group_id)
+            .execute(&state.db)
+            .await?;
     }
-    get_auto_poll(State(state), AuthUser { id: _admin.id }).await
+    get_auto_poll(State(state), user).await
 }

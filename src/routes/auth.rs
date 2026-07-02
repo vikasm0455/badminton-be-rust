@@ -18,7 +18,6 @@ use crate::state::AppState;
 use crate::{email, notify};
 
 const MAX_EMAIL_LEN: usize = 254;
-const INVALID_INVITE_DELAY_MS: u64 = 200;
 
 type CookieResp<T> = (AppendHeaders<[(HeaderName, String); 1]>, Json<ApiResponse<T>>);
 
@@ -35,63 +34,13 @@ fn valid_display_name(name: &str) -> bool {
     len >= 2 && len <= 30 && name.chars().all(|c| c.is_alphanumeric() || c == ' ')
 }
 
-// ---- invite validation -----------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct ValidateInviteReq {
-    pub code: String,
-}
-
-/// Returns 200 if the code is usable, 400 otherwise — without revealing *why*
-/// (PRD §4.1.3, anti-enumeration), plus a constant ~200ms delay on failure.
-pub async fn validate_invite(
-    State(state): State<AppState>,
-    ClientIp(ip): ClientIp,
-    Json(req): Json<ValidateInviteReq>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    otp::check_invite_attempt(&state, ip).await?;
-    let code = req.code.trim();
-
-    let ok = invite_is_usable(&state, code).await?;
-    if !ok {
-        security::log(
-            &state,
-            event::INVALID_INVITE_ATTEMPT,
-            None,
-            Some(ip),
-            json!({ "code_len": code.len() }),
-        )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(INVALID_INVITE_DELAY_MS)).await;
-        return Err(ApiError::BadRequest(
-            "This invite link is invalid or has expired. Ask the admin for a new one.".into(),
-        ));
-    }
-    Ok(Json(ApiResponse::ok(json!({ "valid": true }))))
-}
-
-async fn invite_is_usable(state: &AppState, code: &str) -> Result<bool, ApiError> {
-    if code.len() != 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Ok(false);
-    }
-    let row: Option<(Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as(
-            "SELECT used_by, revoked_at, expires_at FROM invite_codes WHERE LOWER(code) = LOWER($1)",
-        )
-        .bind(code)
-        .fetch_optional(&state.db)
-        .await?;
-    let Some((used_by, revoked_at, expires_at)) = row else {
-        return Ok(false);
-    };
-    Ok(used_by.is_none() && revoked_at.is_none() && expires_at > crate::time::now())
-}
-
 // ---- signup ----------------------------------------------------------------
+// Open signup (public app): anyone verifies their email via OTP and is active
+// immediately. Access control lives in GROUPS — a fresh account sees nothing
+// until it creates a group or accepts an email invite.
 
 #[derive(Deserialize)]
 pub struct SignupReq {
-    pub code: String,
     pub display_name: String,
     pub email: String,
 }
@@ -112,7 +61,6 @@ pub async fn signup(
 ) -> Result<Json<ApiResponse<VerificationPending>>, ApiError> {
     let email = normalize_email(&req.email);
     let display_name = req.display_name.trim().to_string();
-    let code = req.code.trim().to_string();
 
     if !valid_email(&email) {
         return Err(ApiError::BadRequest("a valid email is required".into()));
@@ -122,15 +70,8 @@ pub async fn signup(
             "display name must be 2–30 letters, numbers or spaces".into(),
         ));
     }
-    otp::check_invite_attempt(&state, ip).await?;
-    if !invite_is_usable(&state, &code).await? {
-        tokio::time::sleep(std::time::Duration::from_millis(INVALID_INVITE_DELAY_MS)).await;
-        return Err(ApiError::BadRequest(
-            "This invite link is invalid or has expired. Ask the admin for a new one.".into(),
-        ));
-    }
 
-    // Existing email → tell them to log in. No OTP, invite not consumed.
+    // Existing email → tell them to log in. No OTP issued.
     let exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE LOWER(email) = $1")
             .bind(&email)
@@ -147,7 +88,7 @@ pub async fn signup(
 
     // Stash the pending signup so /signup/verify can create the account.
     if let Some(mut r) = state.redis.clone() {
-        let stash = json!({ "code": code, "display_name": display_name }).to_string();
+        let stash = json!({ "display_name": display_name }).to_string();
         let _: Result<(), _> = r
             .set_ex(format!("pending_signup:{email}"), stash, otp::OTP_TTL_SECS as u64)
             .await;
@@ -173,16 +114,11 @@ pub struct VerifyReq {
     pub code: String,
 }
 
-#[derive(Serialize)]
-pub struct SignupVerified {
-    pub status: String,
-}
-
 pub async fn signup_verify(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     Json(req): Json<VerifyReq>,
-) -> Result<Json<ApiResponse<SignupVerified>>, ApiError> {
+) -> Result<CookieResp<LoginResult>, ApiError> {
     let email = normalize_email(&req.email);
     match otp::verify_code(&state, OtpPurpose::Signup, &email, req.code.trim()).await? {
         VerifyResult::Ok => {}
@@ -210,28 +146,18 @@ pub async fn signup_verify(
         .clone()
         .ok_or_else(|| ApiError::Internal("session store unavailable".into()))?;
     let stash: Option<String> = r.get(format!("pending_signup:{email}")).await.unwrap_or(None);
-    let stash = stash.ok_or_else(|| {
-        ApiError::BadRequest("Signup session expired. Please start again from your invite link.".into())
-    })?;
+    let stash = stash
+        .ok_or_else(|| ApiError::BadRequest("Signup session expired. Please start again.".into()))?;
     let parsed: serde_json::Value = serde_json::from_str(&stash).unwrap_or(json!({}));
-    let code = parsed.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let display_name = parsed.get("display_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Re-check invite (could have been revoked/used since) and consume it.
-    if !invite_is_usable(&state, &code).await? {
-        return Err(ApiError::BadRequest(
-            "This invite link is no longer valid. Ask the admin for a new one.".into(),
-        ));
-    }
-
-    // Create the user (pending) and consume the invite atomically-ish.
-    let mut tx = state.db.begin().await?;
+    // Open signup: the account is active immediately. Groups gate everything else.
     let user_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO users (display_name, email, status) VALUES ($1, $2, 'pending') RETURNING id",
+        "INSERT INTO users (display_name, email, status) VALUES ($1, $2, 'active') RETURNING id",
     )
     .bind(&display_name)
     .bind(&email)
-    .fetch_one(&mut *tx)
+    .fetch_one(&state.db)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -239,24 +165,18 @@ pub async fn signup_verify(
         }
         _ => ApiError::Db(e),
     })?;
-    sqlx::query(
-        "UPDATE invite_codes SET used_by = $1, used_at = NOW()
-         WHERE LOWER(code) = LOWER($2) AND used_by IS NULL",
-    )
-    .bind(user_id)
-    .bind(&code)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
 
     let _: Result<(), _> = r.del(format!("pending_signup:{email}")).await;
     security::log(&state, event::OTP_SUCCESS, Some(user_id), Some(ip), json!({ "purpose": "signup" })).await;
-    security::log(&state, event::INVITE_USED, Some(user_id), Some(ip), json!({})).await;
+    security::log(&state, event::LOGIN_SUCCESS, Some(user_id), Some(ip), json!({ "via": "signup" })).await;
 
-    // Tell the admin someone wants in.
-    notify::signup_request(&state, &display_name);
-
-    Ok(Json(ApiResponse::ok(SignupVerified { status: "pending".into() })))
+    // Log them straight in — verifying the OTP already proved the email.
+    let token = issue_token(user_id, "member", &state.config.jwt_secret)?;
+    let cookie = auth_cookie(&token, state.config.cookie_secure);
+    Ok((
+        AppendHeaders([(SET_COOKIE, cookie)]),
+        Json(ApiResponse::ok(LoginResult { status: "active".into(), is_admin: false })),
+    ))
 }
 
 // ---- login -----------------------------------------------------------------
@@ -335,7 +255,7 @@ pub async fn login_verify(
         VerifyResult::Wrong { remaining } => {
             if otp::note_login_failure(&state, &email).await {
                 security::log(&state, event::ACCOUNT_LOCKED, None, Some(ip), json!({ "email": email })).await;
-                notify::signup_request(&state, &format!("⚠️ account locked: {email}"));
+                notify::operator_alert(&state, &format!("Account locked after repeated failures: {email}"));
             }
             security::log(&state, event::LOGIN_FAILED, None, Some(ip), json!({ "email": email })).await;
             return Err(ApiError::BadRequest(format!(
@@ -401,8 +321,13 @@ pub async fn me(
     session: SessionUser,
 ) -> Result<Json<ApiResponse<MeProfile>>, ApiError> {
     let mut profile: MeProfile = sqlx::query_as(
-        "SELECT id, display_name, email, role, status, created_at, notif_prefs
-         FROM users WHERE id = $1",
+        "SELECT u.id, u.display_name, u.email, u.role, u.status, u.created_at, u.notif_prefs,
+                u.active_group_id, g.name AS active_group_name, gm.role AS active_group_role,
+                (SELECT COUNT(*) FROM group_members x WHERE x.user_id = u.id) AS groups_count
+         FROM users u
+         LEFT JOIN groups g ON g.id = u.active_group_id
+         LEFT JOIN group_members gm ON gm.group_id = u.active_group_id AND gm.user_id = u.id
+         WHERE u.id = $1",
     )
     .bind(session.id)
     .fetch_optional(&state.db)

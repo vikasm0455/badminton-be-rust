@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{AdminUser, AuthUser};
+use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::models::ApiResponse;
+use crate::routes::groups::{active_group, require_group_admin};
 use crate::state::{AppState, LiveEvent};
 use crate::{notify, ocr, security, time};
 use crate::security::event;
@@ -22,17 +23,26 @@ pub struct CredentialView {
     pub posted_by_name: String,
     pub posted_at: DateTime<Utc>,
     pub has_screenshot: bool,
-    /// Locked by an active, non-expired reservation.
+    /// Locked by an active, non-expired reservation (any group — the login is
+    /// physically on a court regardless of who logged it).
     pub in_use: bool,
     pub in_use_court: Option<i16>,
     /// When today's credentials are auto-cleared (next 23:59 LA), as UTC.
     pub clears_at: DateTime<Utc>,
+    /// The caller posted this login (can manage shares / delete it).
+    pub is_mine: bool,
+    /// Groups this login is shared with — populated only when is_mine.
+    pub shared_group_ids: Vec<Uuid>,
 }
 
+/// Today's logins visible in the caller's ACTIVE group: everything shared with
+/// that group, plus the caller's own posts (even if unshared here, so they can
+/// still manage them).
 pub async fn today(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Json<ApiResponse<Vec<CredentialView>>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
     let game_date = time::today();
     let clears_at = time::la_datetime_to_utc(
         game_date,
@@ -51,25 +61,53 @@ pub async fn today(
                        ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
              FROM court_credentials c JOIN users u ON u.id = c.posted_by
              WHERE c.game_date = $1
+               AND (c.posted_by = $2
+                    OR EXISTS (SELECT 1 FROM credential_shares s
+                               WHERE s.credential_id = c.id AND s.group_id = $3))
              ORDER BY c.posted_at ASC",
         )
         .bind(game_date)
+        .bind(user.id)
+        .bind(ctx.group_id)
         .fetch_all(&state.db)
         .await?;
 
+    // Share lists for the caller's own logins (one query for all of them).
+    let mine: Vec<Uuid> = rows.iter().filter(|r| r.3 == user.id).map(|r| r.0).collect();
+    let shares: Vec<(Uuid, Uuid)> = if mine.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT credential_id, group_id FROM credential_shares WHERE credential_id = ANY($1)",
+        )
+        .bind(&mine)
+        .fetch_all(&state.db)
+        .await?
+    };
+
     let cards = rows
         .into_iter()
-        .map(|(id, name, pass, posted_by, posted_by_name, posted_at, shot, court)| CredentialView {
-            id,
-            bintang_name: name,
-            bintang_password: pass,
-            posted_by,
-            posted_by_name,
-            posted_at,
-            has_screenshot: shot.is_some(),
-            in_use: court.is_some(),
-            in_use_court: court,
-            clears_at,
+        .map(|(id, name, pass, posted_by, posted_by_name, posted_at, shot, court)| {
+            let is_mine = posted_by == user.id;
+            let shared_group_ids = if is_mine {
+                shares.iter().filter(|(c, _)| *c == id).map(|(_, g)| *g).collect()
+            } else {
+                Vec::new()
+            };
+            CredentialView {
+                id,
+                bintang_name: name,
+                bintang_password: pass,
+                posted_by,
+                posted_by_name,
+                posted_at,
+                has_screenshot: shot.is_some(),
+                in_use: court.is_some(),
+                in_use_court: court,
+                clears_at,
+                is_mine,
+                shared_group_ids,
+            }
         })
         .collect();
     Ok(Json(ApiResponse::ok(cards)))
@@ -81,6 +119,39 @@ pub struct PostCredentialReq {
     pub bintang_password: String,
     /// Optional screenshot path returned by the /ocr endpoint.
     pub screenshot_path: Option<String>,
+    /// Groups to share this login with. Defaults to the active group. Every id
+    /// must be a group the poster belongs to.
+    #[serde(default)]
+    pub group_ids: Option<Vec<Uuid>>,
+}
+
+/// Filter `requested` down to groups the user actually belongs to; error on any
+/// id that isn't theirs (no silently sharing into foreign groups).
+async fn validate_share_groups(
+    state: &AppState,
+    user_id: Uuid,
+    requested: &[Uuid],
+) -> Result<Vec<Uuid>, ApiError> {
+    let mut unique: Vec<Uuid> = Vec::new();
+    for g in requested {
+        if !unique.contains(g) {
+            unique.push(*g);
+        }
+    }
+    if unique.is_empty() {
+        return Ok(unique);
+    }
+    let member_of: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT group_id FROM group_members WHERE user_id = $1 AND group_id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&unique)
+    .fetch_all(&state.db)
+    .await?;
+    if member_of.len() != unique.len() {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(unique)
 }
 
 pub async fn post_credential(
@@ -88,6 +159,7 @@ pub async fn post_credential(
     user: AuthUser,
     Json(req): Json<PostCredentialReq>,
 ) -> Result<Json<ApiResponse<CredentialView>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
     let name = req.bintang_name.trim();
     let pass = req.bintang_password.trim();
     if name.is_empty() || name.len() > 50 || pass.is_empty() || pass.len() > 50 {
@@ -99,6 +171,13 @@ pub async fn post_credential(
         .as_deref()
         .filter(|p| p.starts_with(&creds_dir(&state, time::today())));
 
+    // Default share: the group you're playing with right now.
+    let share_groups = match &req.group_ids {
+        Some(ids) => validate_share_groups(&state, user.id, ids).await?,
+        None => vec![ctx.group_id],
+    };
+
+    let mut tx = state.db.begin().await?;
     let id: (Uuid,) = sqlx::query_as(
         "INSERT INTO court_credentials (posted_by, game_date, bintang_name, bintang_password, screenshot_path)
          VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -108,8 +187,16 @@ pub async fn post_credential(
     .bind(name)
     .bind(pass)
     .bind(screenshot)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+    for g in &share_groups {
+        sqlx::query("INSERT INTO credential_shares (credential_id, group_id) VALUES ($1, $2)")
+            .bind(id.0)
+            .bind(g)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
 
     security::log(&state, event::CREDENTIAL_POSTED, Some(user.id), None, serde_json::json!({})).await;
     state.broadcast(LiveEvent::CredentialsChanged);
@@ -118,7 +205,7 @@ pub async fn post_credential(
         .bind(user.id)
         .fetch_one(&state.db)
         .await?;
-    notify::credential_posted(&state, user.id, &poster_name.0);
+    notify::credential_posted(&state, share_groups.clone(), user.id, &poster_name.0);
 
     let cards = today(State(state.clone()), user).await?;
     let card = cards
@@ -186,52 +273,135 @@ pub async fn ocr_credential(
     Ok(Json(ApiResponse::ok(OcrResult { logins, ok, screenshot_path, message })))
 }
 
-/// Stream a credential's screenshot to authenticated members.
+/// Stream a credential's screenshot — only to its owner or members viewing it
+/// through their ACTIVE group (same visibility rule as the today list).
 pub async fn screenshot(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT screenshot_path FROM court_credentials WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
+    let ctx = active_group(&state, user.id).await?;
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT c.screenshot_path FROM court_credentials c
+         WHERE c.id = $1
+           AND (c.posted_by = $2
+                OR EXISTS (SELECT 1 FROM credential_shares s
+                           WHERE s.credential_id = c.id AND s.group_id = $3))",
+    )
+    .bind(id)
+    .bind(user.id)
+    .bind(ctx.group_id)
+    .fetch_optional(&state.db)
+    .await?;
     let path = row.and_then(|r| r.0).ok_or(ApiError::NotFound)?;
     let bytes = tokio::fs::read(&path).await.map_err(|_| ApiError::NotFound)?;
     let ctype = if path.ends_with(".png") { "image/png" } else { "image/jpeg" };
     Ok(([(header::CONTENT_TYPE, ctype)], bytes).into_response())
 }
 
-pub async fn delete_credential(
+#[derive(Deserialize)]
+pub struct SetSharesReq {
+    pub group_ids: Vec<Uuid>,
+}
+
+/// Owner-only: re-point which groups can see this login.
+pub async fn set_shares(
     State(state): State<AppState>,
-    admin: AdminUser,
+    user: AuthUser,
     Path(id): Path<Uuid>,
+    Json(req): Json<SetSharesReq>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT screenshot_path FROM court_credentials WHERE id = $1")
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT posted_by FROM court_credentials WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
-    let path = row.ok_or(ApiError::NotFound)?.0;
-    sqlx::query("DELETE FROM court_credentials WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    if let Some(p) = path {
-        let _ = tokio::fs::remove_file(p).await;
+    let (owner,) = owner.ok_or(ApiError::NotFound)?;
+    if owner != user.id {
+        return Err(ApiError::Forbidden);
     }
-    security::log(&state, event::CREDENTIAL_DELETED, Some(admin.id), None, serde_json::json!({ "id": id })).await;
+    let groups = validate_share_groups(&state, user.id, &req.group_ids).await?;
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM credential_shares WHERE credential_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    for g in &groups {
+        sqlx::query("INSERT INTO credential_shares (credential_id, group_id) VALUES ($1, $2)")
+            .bind(id)
+            .bind(g)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     state.broadcast(LiveEvent::CredentialsChanged);
-    Ok(Json(ApiResponse::message("Credential deleted.")))
+    Ok(Json(ApiResponse::message("Sharing updated.")))
 }
 
+/// Owner: hard-delete their login everywhere. Group admin (non-owner): remove
+/// it from THEIR group only — other groups' visibility is not theirs to touch.
+pub async fn delete_credential(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let row: Option<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT posted_by, screenshot_path FROM court_credentials WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    let (posted_by, path) = row.ok_or(ApiError::NotFound)?;
+
+    if posted_by == user.id {
+        sqlx::query("DELETE FROM court_credentials WHERE id = $1")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        if let Some(p) = path {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        security::log(&state, event::CREDENTIAL_DELETED, Some(user.id), None, serde_json::json!({ "id": id })).await;
+        state.broadcast(LiveEvent::CredentialsChanged);
+        return Ok(Json(ApiResponse::message("Login deleted.")));
+    }
+
+    // Not the owner → must be an admin of the active group, and the login must
+    // be shared there; the action is an unshare, not a delete.
+    let ctx = require_group_admin(&state, user.id).await?;
+    let res = sqlx::query(
+        "DELETE FROM credential_shares WHERE credential_id = $1 AND group_id = $2",
+    )
+    .bind(id)
+    .bind(ctx.group_id)
+    .execute(&state.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    security::log(&state, event::CREDENTIAL_DELETED, Some(user.id), None, serde_json::json!({ "id": id, "unshared_from": ctx.group_id })).await;
+    state.broadcast(LiveEvent::CredentialsChanged);
+    Ok(Json(ApiResponse::message("Login removed from this group.")))
+}
+
+/// Group admin: remove ALL of today's logins from this group's view (their
+/// owners keep them; other groups are untouched).
 pub async fn clear_today(
     State(state): State<AppState>,
-    admin: AdminUser,
+    user: AuthUser,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let removed = crate::jobs::clear_credentials_for(&state, time::today()).await?;
-    security::log(&state, event::ADMIN_ACTION, Some(admin.id), None, serde_json::json!({ "action": "clear_credentials", "removed": removed })).await;
+    let ctx = require_group_admin(&state, user.id).await?;
+    let res = sqlx::query(
+        "DELETE FROM credential_shares s
+         USING court_credentials c
+         WHERE s.credential_id = c.id AND s.group_id = $1 AND c.game_date = $2",
+    )
+    .bind(ctx.group_id)
+    .bind(time::today())
+    .execute(&state.db)
+    .await?;
+    let removed = res.rows_affected();
+    security::log(&state, event::ADMIN_ACTION, Some(user.id), None, serde_json::json!({ "action": "clear_credentials", "removed": removed })).await;
     state.broadcast(LiveEvent::CredentialsChanged);
     Ok(Json(ApiResponse::ok(serde_json::json!({ "removed": removed }))))
 }

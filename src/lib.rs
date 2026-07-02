@@ -48,18 +48,37 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/health", get(routes::health::health_check))
         .route("/metrics", get(metrics_endpoint))
         // ---- auth ----------------------------------------------------------
-        .route("/api/auth/validate-invite", post(routes::auth::validate_invite))
         .route("/api/auth/signup", post(routes::auth::signup))
         .route("/api/auth/signup/verify", post(routes::auth::signup_verify))
         .route("/api/auth/login", post(routes::auth::login))
         .route("/api/auth/login/verify", post(routes::auth::login_verify))
         .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/me", get(routes::auth::me).patch(routes::auth::update_me))
+        // ---- groups ----------------------------------------------------------
+        .route("/api/groups", get(routes::groups::list_mine).post(routes::groups::create_group))
+        .route("/api/groups/active", put(routes::groups::set_active))
+        .route(
+            "/api/groups/current",
+            get(routes::groups::current_group).put(routes::groups::rename_group),
+        )
+        .route("/api/groups/leave", post(routes::groups::leave_group))
+        .route(
+            "/api/groups/members/:id",
+            put(routes::groups::set_member_role).delete(routes::groups::remove_member),
+        )
+        .route(
+            "/api/groups/invites",
+            get(routes::groups::list_group_invites).post(routes::groups::send_invite),
+        )
+        .route("/api/groups/invites/:id", delete(routes::groups::revoke_invite))
+        .route("/api/invites", get(routes::groups::my_invites))
+        .route("/api/invites/:id/accept", post(routes::groups::accept_invite))
+        .route("/api/invites/:id/decline", post(routes::groups::decline_invite))
         // ---- polls ---------------------------------------------------------
         .route("/api/polls/today", get(routes::polls::today))
         .route("/api/polls/history", get(routes::polls::history))
         .route("/api/polls", post(routes::polls::create_poll))
-        .route("/api/polls/:id", get(routes::polls::get_poll))
+        .route("/api/polls/:id", get(routes::polls::get_poll).delete(routes::polls::delete_poll))
         .route("/api/polls/:id/vote", put(routes::polls::vote).delete(routes::polls::retract_vote))
         .route("/api/polls/:id/attendance", post(routes::polls::confirm_attendance))
         .route("/api/members", get(routes::polls::members))
@@ -69,6 +88,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/credentials/ocr", post(routes::credentials::ocr_credential))
         .route("/api/credentials/clear-today", post(routes::credentials::clear_today))
         .route("/api/credentials/:id", delete(routes::credentials::delete_credential))
+        .route("/api/credentials/:id/shares", put(routes::credentials::set_shares))
         .route("/api/credentials/:id/screenshot", get(routes::credentials::screenshot))
         // ---- reservations --------------------------------------------------
         .route("/api/reservations/today", get(routes::reservations::today))
@@ -105,7 +125,6 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/admin/invites", get(routes::admin::list_invites).post(routes::admin::generate_invites))
         .route("/api/admin/invites/:id/revoke", post(routes::admin::revoke_invite))
         .route("/api/admin/security", get(routes::admin::security_log))
-        .route("/api/admin/polls/:id", delete(routes::admin::delete_poll))
         .route("/api/admin/health", get(routes::admin::system_health))
         // ---- middleware ----------------------------------------------------
         // route_layer so MatchedPath is populated when track_metrics runs

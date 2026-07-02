@@ -51,6 +51,27 @@ pub async fn send_otp(state: &AppState, to: &str, code: &str) -> Result<(), ApiE
     .await
 }
 
+pub async fn send_group_invite(
+    state: &AppState,
+    to: &str,
+    group_name: &str,
+    inviter: &str,
+) -> Result<(), ApiError> {
+    let base = state.config.app_base_url.as_deref().unwrap_or("");
+    let link = if base.is_empty() { "the RallyUp app".to_string() } else { base.to_string() };
+    send_email(
+        state,
+        to,
+        &format!("{inviter} invited you to {group_name} on RallyUp"),
+        &format!(
+            "{inviter} invited you to join the badminton group “{group_name}” on RallyUp.\n\n\
+             Sign up (or log in) with this email address at {link} and you'll see the invite waiting.\n\n\
+             — RallyUp"
+        ),
+    )
+    .await
+}
+
 pub async fn send_approved(state: &AppState, to: &str, name: &str) -> Result<(), ApiError> {
     send_email(
         state,

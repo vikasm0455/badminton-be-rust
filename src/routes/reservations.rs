@@ -4,10 +4,11 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{AdminUser, AuthUser};
+use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::models::ApiResponse;
 use crate::ocr::BoardCourt;
+use crate::routes::groups::{GroupCtx, active_group, require_group_admin};
 use crate::state::{AppState, LiveEvent};
 use crate::{notify, ocr, time};
 
@@ -66,8 +67,9 @@ fn slots_conflict(a: &ActiveSlot, b: &ActiveSlot) -> bool {
 
 pub async fn today(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Json<ApiResponse<Vec<ReservationView>>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
     let mut rows: Vec<ReservationView> = sqlx::query_as(
         "SELECT r.id, r.court_number, r.credential_id, r.credential_name_snapshot AS credential_name,
                 COALESCE(
@@ -85,10 +87,11 @@ pub async fn today(
          FROM court_reservations r
          JOIN users u ON u.id = r.reserved_by
          LEFT JOIN users cu ON cu.id = r.completed_by
-         WHERE r.game_date = $1
+         WHERE r.game_date = $1 AND r.group_id = $2
          ORDER BY (r.status = 'active') DESC, r.expiry_at ASC",
     )
     .bind(time::today())
+    .bind(ctx.group_id)
     .fetch_all(&state.db)
     .await?;
 
@@ -147,6 +150,7 @@ pub async fn create(
     user: AuthUser,
     Json(req): Json<CreateReservationReq>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
     if !(1..=53).contains(&req.court_number) {
         return Err(ApiError::BadRequest("Court number must be between 1 and 53.".into()));
     }
@@ -208,11 +212,20 @@ pub async fn create(
 
     let mut attached: Vec<(Uuid, String)> = Vec::new();
     for cid in &cred_ids {
-        let cred: Option<(String, chrono::NaiveDate)> =
-            sqlx::query_as("SELECT bintang_name, game_date FROM court_credentials WHERE id = $1")
-                .bind(cid)
-                .fetch_optional(&state.db)
-                .await?;
+        // The login must be visible to this group: shared with it, or the
+        // caller's own post.
+        let cred: Option<(String, chrono::NaiveDate)> = sqlx::query_as(
+            "SELECT c.bintang_name, c.game_date FROM court_credentials c
+             WHERE c.id = $1
+               AND (c.posted_by = $2
+                    OR EXISTS (SELECT 1 FROM credential_shares s
+                               WHERE s.credential_id = c.id AND s.group_id = $3))",
+        )
+        .bind(cid)
+        .bind(user.id)
+        .bind(ctx.group_id)
+        .fetch_optional(&state.db)
+        .await?;
         let (name, gdate) = cred.ok_or_else(|| ApiError::BadRequest("credential not found".into()))?;
         if gdate != time::today() {
             return Err(ApiError::BadRequest("that credential is not for today".into()));
@@ -243,8 +256,8 @@ pub async fn create(
     let inserted = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO court_reservations
             (court_number, credential_id, credential_name_snapshot, reserved_by, court_type,
-             player_count, duration_minutes, start_at, expiry_at, queue_number, notes, game_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+             player_count, duration_minutes, start_at, expiry_at, queue_number, notes, game_date, group_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(req.court_number)
     .bind(primary_id)
@@ -258,6 +271,7 @@ pub async fn create(
     .bind(req.queue_number)
     .bind(notes)
     .bind(time::today())
+    .bind(ctx.group_id)
     .fetch_one(&state.db)
     .await;
     let id: (Uuid,) = match inserted {
@@ -296,7 +310,7 @@ pub async fn create(
     } else {
         None
     };
-    notify::reservation_logged(&state, user.id, &by_name.0, req.court_number, duration, future_time);
+    notify::reservation_logged(&state, ctx.group_id, user.id, &by_name.0, req.court_number, duration, future_time);
 
     let view = load_one(&state, id.0).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse::ok(view)))
@@ -373,13 +387,14 @@ fn name_matches(login: &str, board_names: &[String]) -> bool {
 /// board). Creates nothing — the client confirms via the normal create route.
 pub async fn scan_board(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<BoardScanResult>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
     let max_bytes = state.config.max_upload_size_mb * 1024 * 1024;
     let (bytes, content_type) = crate::upload::read_image_field(multipart, max_bytes).await?;
 
-    // Today's posted logins + the court each is currently locked to (if any).
+    // Today's logins visible to this group + the court each is locked to (if any).
     let creds: Vec<(Uuid, String, Option<i16>)> = sqlx::query_as(
         "SELECT c.id, c.bintang_name,
                 (SELECT r.court_number FROM court_reservations r
@@ -388,9 +403,13 @@ pub async fn scan_board(
                                      WHERE rc.reservation_id = r.id AND rc.credential_id = c.id))
                      AND r.status = 'active' AND r.expiry_at > NOW()
                    ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
-         FROM court_credentials c WHERE c.game_date = $1",
+         FROM court_credentials c
+         WHERE c.game_date = $1
+           AND EXISTS (SELECT 1 FROM credential_shares s
+                       WHERE s.credential_id = c.id AND s.group_id = $2)",
     )
     .bind(time::today())
+    .bind(ctx.group_id)
     .fetch_all(&state.db)
     .await?;
 
@@ -503,17 +522,33 @@ fn build_matches(creds: &[(Uuid, String, Option<i16>)], board: &[BoardCourt]) ->
     out
 }
 
+/// Fetch a reservation's status/court/group, verifying it belongs to the
+/// caller's active group (404 otherwise — other groups' courts are invisible).
+async fn reservation_in_group(
+    state: &AppState,
+    id: Uuid,
+    ctx: &GroupCtx,
+) -> Result<(String, i16), ApiError> {
+    let row: Option<(String, i16, Option<Uuid>)> = sqlx::query_as(
+        "SELECT status, court_number, group_id FROM court_reservations WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (status, court, group) = row.ok_or(ApiError::NotFound)?;
+    if group != Some(ctx.group_id) {
+        return Err(ApiError::NotFound);
+    }
+    Ok((status, court))
+}
+
 pub async fn complete(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
-    let row: Option<(String, i16)> =
-        sqlx::query_as("SELECT status, court_number FROM court_reservations WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-    let (status, court) = row.ok_or(ApiError::NotFound)?;
+    let ctx = active_group(&state, user.id).await?;
+    let (status, court) = reservation_in_group(&state, id, &ctx).await?;
     if status != "active" {
         return Err(ApiError::Conflict("This reservation is no longer active.".into()));
     }
@@ -531,7 +566,7 @@ pub async fn complete(
         .bind(user.id)
         .fetch_one(&state.db)
         .await?;
-    notify::reservation_complete(&state, user.id, court, &by_name.0);
+    notify::reservation_complete(&state, ctx.group_id, user.id, court, &by_name.0);
 
     let view = load_one(&state, id).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse::ok(view)))
@@ -539,13 +574,17 @@ pub async fn complete(
 
 pub async fn cancel(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let res = sqlx::query("UPDATE court_reservations SET status = 'cancelled' WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    let ctx = require_group_admin(&state, user.id).await?;
+    let res = sqlx::query(
+        "UPDATE court_reservations SET status = 'cancelled' WHERE id = $1 AND group_id = $2",
+    )
+    .bind(id)
+    .bind(ctx.group_id)
+    .execute(&state.db)
+    .await?;
     if res.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
@@ -582,14 +621,17 @@ pub struct EditReservationReq {
     pub credential_ids: Option<Vec<Uuid>>,
 }
 
-/// Edit a logged court. Open to any member (like marking complete) so mistakes
-/// can be fixed; each field is optional and only applied when present.
+/// Edit a logged court. Open to any member of the reservation's group (like
+/// marking complete) so mistakes can be fixed; each field is optional and only
+/// applied when present.
 pub async fn edit(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(id): Path<Uuid>,
     Json(req): Json<EditReservationReq>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
+    let ctx = active_group(&state, user.id).await?;
+    reservation_in_group(&state, id, &ctx).await?;
     let dup = || ApiError::Conflict("That court and queue slot already has an active reservation.".into());
 
     if let Some(c) = req.court_number {
@@ -687,11 +729,19 @@ pub async fn edit(
         }
         let mut resolved: Vec<(Uuid, String)> = Vec::new();
         for cid in &new_ids {
-            let cred: Option<(String, chrono::NaiveDate)> =
-                sqlx::query_as("SELECT bintang_name, game_date FROM court_credentials WHERE id = $1")
-                    .bind(cid)
-                    .fetch_optional(&state.db)
-                    .await?;
+            // Same visibility rule as create(): shared with this group or my own.
+            let cred: Option<(String, chrono::NaiveDate)> = sqlx::query_as(
+                "SELECT c.bintang_name, c.game_date FROM court_credentials c
+                 WHERE c.id = $1
+                   AND (c.posted_by = $2
+                        OR EXISTS (SELECT 1 FROM credential_shares s
+                                   WHERE s.credential_id = c.id AND s.group_id = $3))",
+            )
+            .bind(cid)
+            .bind(user.id)
+            .bind(ctx.group_id)
+            .fetch_optional(&state.db)
+            .await?;
             let (name, gdate) = cred.ok_or_else(|| ApiError::BadRequest("credential not found".into()))?;
             if gdate != time::today() {
                 return Err(ApiError::BadRequest("that credential is not for today".into()));
@@ -753,16 +803,19 @@ pub async fn edit(
 
 /// Force-unlock a credential by detaching it from its active reservation(s) —
 /// both as the primary login and as one of several attached via the board scan.
+/// Group-admin action, scoped to reservations of THEIR group only.
 pub async fn unlock_credential(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    user: AuthUser,
     Path(cred_id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
     sqlx::query(
         "UPDATE court_reservations SET credential_id = NULL
-         WHERE credential_id = $1 AND status = 'active'",
+         WHERE credential_id = $1 AND status = 'active' AND group_id = $2",
     )
     .bind(cred_id)
+    .bind(ctx.group_id)
     .execute(&state.db)
     .await?;
     // Also detach it where it was attached as a non-primary login on an active
@@ -770,9 +823,11 @@ pub async fn unlock_credential(
     sqlx::query(
         "DELETE FROM reservation_credentials rc
          USING court_reservations cr
-         WHERE rc.credential_id = $1 AND rc.reservation_id = cr.id AND cr.status = 'active'",
+         WHERE rc.credential_id = $1 AND rc.reservation_id = cr.id
+           AND cr.status = 'active' AND cr.group_id = $2",
     )
     .bind(cred_id)
+    .bind(ctx.group_id)
     .execute(&state.db)
     .await?;
     state.broadcast(LiveEvent::CredentialsChanged);

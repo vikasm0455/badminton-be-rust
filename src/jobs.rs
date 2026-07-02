@@ -44,32 +44,44 @@ async fn tick(state: &AppState) -> Result<(), ApiError> {
     timer_and_prestart(state).await?;
 
     // ---- daily time-of-day jobs (guarded once/day) ------------------------
-    // Auto-poll.
-    if read_cfg(state, "auto_poll_enabled", "true").await == "true" {
-        if let Some(t) = time::parse_hhmm(&read_cfg(state, "auto_poll_time", "10:00").await) {
-            if due(state, "auto_poll", t, now_t, today).await {
-                let created = ensure_today_poll(state).await?;
-                stamp(state, "auto_poll", today).await;
-                if created {
-                    tracing::info!("auto-poll created");
-                }
+    // Per-group auto-poll + final reminder.
+    let auto_groups: Vec<(Uuid, NaiveTime, NaiveTime, String)> = sqlx::query_as(
+        "SELECT id, auto_poll_time, final_reminder_time, auto_poll_note
+         FROM groups WHERE auto_poll_enabled = true",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (gid, poll_t, reminder_t, note) in auto_groups {
+        if due(state, &format!("auto_poll_{gid}"), poll_t, now_t, today).await {
+            let created = ensure_today_poll(state, gid, poll_t, &note).await?;
+            stamp(state, &format!("auto_poll_{gid}"), today).await;
+            if created {
+                tracing::info!(group = %gid, "auto-poll created");
             }
         }
-        // Final reminder: only if fewer than 2 Yes votes (PRD §21 Q4).
-        if let Some(t) =
-            time::parse_hhmm(&read_cfg(state, "auto_poll_final_reminder_time", "17:00").await)
-        {
-            if due(state, "final_reminder", t, now_t, today).await {
-                final_reminder(state, today).await;
-                stamp(state, "final_reminder", today).await;
+        // Final reminder: only if fewer than 2 Yes votes (PRD §21 Q4). Stamped
+        // only on success so a transient DB error retries next tick.
+        if due(state, &format!("final_reminder_{gid}"), reminder_t, now_t, today).await {
+            match final_reminder(state, gid, today).await {
+                Ok(()) => stamp(state, &format!("final_reminder_{gid}"), today).await,
+                Err(e) => tracing::warn!(error = %e, group = %gid, "final reminder failed; will retry"),
             }
         }
     }
 
     // Credential midnight cleanup (23:59).
     if due(state, "cred_cleanup", NaiveTime::from_hms_opt(23, 59, 0).unwrap(), now_t, today).await {
+        // Which groups had logins today? (Fetched before the delete wipes shares.)
+        let groups: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT s.group_id FROM credential_shares s
+             JOIN court_credentials c ON c.id = s.credential_id WHERE c.game_date = $1",
+        )
+        .bind(today)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
         let removed = clear_credentials_for(state, today).await?;
-        notify::credentials_cleared(state);
+        notify::credentials_cleared(state, groups.into_iter().map(|g| g.0).collect());
         state.broadcast(LiveEvent::CredentialsChanged);
         stamp(state, "cred_cleanup", today).await;
         tracing::info!(removed, "midnight credential cleanup");
@@ -103,6 +115,7 @@ async fn tick(state: &AppState) -> Result<(), ApiError> {
 #[derive(sqlx::FromRow)]
 struct TimerRow {
     id: Uuid,
+    group_id: Uuid,
     court_number: i16,
     start_at: chrono::DateTime<chrono::Utc>,
     expiry_at: chrono::DateTime<chrono::Utc>,
@@ -112,9 +125,9 @@ struct TimerRow {
 async fn timer_and_prestart(state: &AppState) -> Result<(), ApiError> {
     let now = time::now();
     let rows: Vec<TimerRow> = sqlx::query_as(
-        "SELECT id, court_number, start_at, expiry_at, notification_sent_flags
+        "SELECT id, group_id, court_number, start_at, expiry_at, notification_sent_flags
          FROM court_reservations
-         WHERE status = 'active' AND game_date = $1",
+         WHERE status = 'active' AND game_date = $1 AND group_id IS NOT NULL",
     )
     .bind(time::today())
     .fetch_all(&state.db)
@@ -131,7 +144,7 @@ async fn timer_and_prestart(state: &AppState) -> Result<(), ApiError> {
             // Pre-start: within 5 minutes of starting.
             let to_start = (r.start_at - now).num_seconds();
             if to_start <= 5 * 60 && !sent(&flags, "prestart") {
-                notify::prestart(state, r.court_number);
+                notify::prestart(state, r.group_id, r.court_number);
                 flags.insert("prestart".into(), json!(true));
                 changed = true;
             }
@@ -139,13 +152,13 @@ async fn timer_and_prestart(state: &AppState) -> Result<(), ApiError> {
             let remaining = (r.expiry_at - now).num_seconds();
             for t in [15i64, 10, 5] {
                 if remaining <= t * 60 && remaining > 0 && !sent(&flags, &t.to_string()) {
-                    notify::timer_threshold(state, r.court_number, t as i32);
+                    notify::timer_threshold(state, r.group_id, r.court_number, t as i32);
                     flags.insert(t.to_string(), json!(true));
                     changed = true;
                 }
             }
             if remaining <= 0 && !sent(&flags, "0") {
-                notify::timer_threshold(state, r.court_number, 0);
+                notify::timer_threshold(state, r.group_id, r.court_number, 0);
                 flags.insert("0".into(), json!(true));
                 changed = true;
                 state.broadcast(LiveEvent::ReservationsChanged);
@@ -165,41 +178,60 @@ async fn timer_and_prestart(state: &AppState) -> Result<(), ApiError> {
 
 // ---- poll helpers ----------------------------------------------------------
 
-/// Create today's poll if none exists. Returns true if it created one.
-pub async fn ensure_today_poll(state: &AppState) -> Result<bool, ApiError> {
+/// Create today's poll for a group if none exists. Returns true if created.
+pub async fn ensure_today_poll(
+    state: &AppState,
+    group_id: Uuid,
+    proposed_time: NaiveTime,
+    note: &str,
+) -> Result<bool, ApiError> {
     let today = time::today();
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM polls WHERE game_date = $1")
-        .bind(today)
-        .fetch_optional(&state.db)
-        .await?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM polls WHERE game_date = $1 AND group_id = $2")
+            .bind(today)
+            .bind(group_id)
+            .fetch_optional(&state.db)
+            .await?;
     if exists.is_some() {
         return Ok(false);
     }
 
-    let creator: Option<(Uuid,)> = admin_user_id(state).await?;
+    // Attribute to the group's earliest admin.
+    let creator: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM group_members
+         WHERE group_id = $1 AND role = 'admin' ORDER BY joined_at ASC LIMIT 1",
+    )
+    .bind(group_id)
+    .fetch_optional(&state.db)
+    .await?;
     let Some((creator_id,)) = creator else {
-        tracing::warn!("auto-poll: no admin user to attribute poll to — skipping");
+        tracing::warn!(group = %group_id, "auto-poll: group has no admin — skipping");
         return Ok(false);
     };
-    let note = read_cfg(state, "auto_poll_note", "").await;
-    let note_opt = if note.trim().is_empty() { None } else { Some(note) };
-    let proposed = read_cfg(state, "auto_poll_time", "10:00").await;
-    let proposed_time = time::parse_hhmm(&proposed).unwrap_or(NaiveTime::from_hms_opt(18, 0, 0).unwrap());
+    let note_opt = if note.trim().is_empty() { None } else { Some(note.trim().to_string()) };
 
     let insert: Result<(Uuid,), sqlx::Error> = sqlx::query_as(
-        "INSERT INTO polls (created_by, game_date, proposed_time, note, auto_created)
-         VALUES ($1, $2, $3, $4, true) RETURNING id",
+        "INSERT INTO polls (created_by, game_date, proposed_time, note, auto_created, group_id)
+         VALUES ($1, $2, $3, $4, true, $5) RETURNING id",
     )
     .bind(creator_id)
     .bind(today)
     .bind(proposed_time)
     .bind(note_opt)
+    .bind(group_id)
     .fetch_one(&state.db)
     .await;
     match insert {
         Ok((poll_id,)) => {
             state.broadcast(LiveEvent::PollChanged { poll_id });
-            notify::poll_created(state, None, "RallyUp", &proposed, true);
+            notify::poll_created(
+                state,
+                group_id,
+                None,
+                "RallyUp",
+                &proposed_time.format("%H:%M").to_string(),
+                true,
+            );
             Ok(true)
         }
         // Lost the race against a manual poll — that's fine.
@@ -208,34 +240,21 @@ pub async fn ensure_today_poll(state: &AppState) -> Result<bool, ApiError> {
     }
 }
 
-async fn final_reminder(state: &AppState, today: NaiveDate) {
+async fn final_reminder(state: &AppState, group_id: Uuid, today: NaiveDate) -> Result<(), ApiError> {
     let row: Option<(Uuid, i64)> = sqlx::query_as(
         "SELECT p.id, (SELECT COUNT(*) FROM poll_votes v WHERE v.poll_id = p.id AND v.vote = 'yes')
-         FROM polls p WHERE p.game_date = $1",
+         FROM polls p WHERE p.game_date = $1 AND p.group_id = $2",
     )
     .bind(today)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
-    if let Some((_id, yes)) = row {
-        if yes < 2 {
-            notify::poll_created(state, None, "RallyUp", "", true);
-        }
-    }
-}
-
-async fn admin_user_id(state: &AppState) -> Result<Option<(Uuid,)>, ApiError> {
-    let by_email = state.config.admin_email.clone();
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM users
-         WHERE status = 'active' AND (role = 'admin' OR LOWER(email) = COALESCE($1, ''))
-         ORDER BY created_at ASC LIMIT 1",
-    )
-    .bind(by_email)
+    .bind(group_id)
     .fetch_optional(&state.db)
     .await?;
-    Ok(row)
+    if let Some((_id, yes)) = row {
+        if yes < 2 {
+            notify::final_reminder(state, group_id, yes);
+        }
+    }
+    Ok(())
 }
 
 // ---- credential cleanup ----------------------------------------------------

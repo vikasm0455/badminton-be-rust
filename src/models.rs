@@ -41,7 +41,14 @@ pub struct MeProfile {
     pub role: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// Site-level operator (security/data pages) — NOT group admin.
     #[sqlx(default)]
     pub is_admin: bool,
     pub notif_prefs: serde_json::Value,
+    /// The group currently scoping the app (None → onboarding).
+    pub active_group_id: Option<Uuid>,
+    pub active_group_name: Option<String>,
+    /// "admin" | "member" within the active group.
+    pub active_group_role: Option<String>,
+    pub groups_count: i64,
 }

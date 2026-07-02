@@ -355,22 +355,6 @@ pub async fn security_log(
 
 // ---- data / health ---------------------------------------------------------
 
-pub async fn delete_poll(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<Uuid>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let res = sqlx::query("DELETE FROM polls WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    if res.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
-    }
-    security::log(&state, event::ADMIN_ACTION, Some(admin.id), None, json!({ "action": "delete_poll", "poll": id })).await;
-    Ok(Json(ApiResponse::message("Poll deleted.")))
-}
-
 #[derive(Serialize)]
 pub struct SystemHealth {
     pub db: bool,
