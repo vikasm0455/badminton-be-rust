@@ -56,6 +56,64 @@ pub async fn subscribe(
     Ok(Json(ApiResponse::message("Subscribed.")))
 }
 
+// ---- native device tokens (iOS APNs / Android FCM) ---------------------------
+
+#[derive(Deserialize)]
+pub struct RegisterDeviceReq {
+    /// "apns" | "fcm"
+    pub platform: String,
+    pub token: String,
+    pub device_label: Option<String>,
+}
+
+pub async fn register_device(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<RegisterDeviceReq>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if !matches!(req.platform.as_str(), "apns" | "fcm") {
+        return Err(ApiError::BadRequest("platform must be apns or fcm".into()));
+    }
+    let token = req.token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(ApiError::BadRequest("invalid device token".into()));
+    }
+    let label = req.device_label.as_deref().map(|s| s.chars().take(100).collect::<String>());
+    // Upsert by token: a reinstall (or user switch) re-claims the same token.
+    sqlx::query(
+        "INSERT INTO device_tokens (user_id, platform, token, device_label, active)
+         VALUES ($1, $2, $3, $4, true)
+         ON CONFLICT (token)
+         DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform,
+                       device_label = EXCLUDED.device_label, active = true",
+    )
+    .bind(user.id)
+    .bind(&req.platform)
+    .bind(token)
+    .bind(label)
+    .execute(&state.db)
+    .await?;
+    Ok(Json(ApiResponse::message("Device registered.")))
+}
+
+#[derive(Deserialize)]
+pub struct UnregisterDeviceReq {
+    pub token: String,
+}
+
+pub async fn unregister_device(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<UnregisterDeviceReq>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    sqlx::query("DELETE FROM device_tokens WHERE token = $1 AND user_id = $2")
+        .bind(req.token.trim())
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(ApiResponse::message("Device unregistered.")))
+}
+
 #[derive(Deserialize)]
 pub struct UnsubscribeReq {
     pub endpoint: String,

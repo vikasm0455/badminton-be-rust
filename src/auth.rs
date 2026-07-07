@@ -26,12 +26,18 @@ pub struct Claims {
 }
 
 pub fn issue_token(user_id: Uuid, role: &str, secret: &str) -> Result<String, ApiError> {
+    issue_token_for(user_id, role, secret, TOKEN_LIFETIME_DAYS)
+}
+
+/// Issue a JWT with an explicit lifetime — native access tokens are short-lived
+/// (their refresh token does the long haul); the web cookie keeps 30 days.
+pub fn issue_token_for(user_id: Uuid, role: &str, secret: &str, days: i64) -> Result<String, ApiError> {
     let now = Utc::now();
     let claims = Claims {
         sub: user_id,
         role: role.to_string(),
         iat: now.timestamp(),
-        exp: (now + Duration::days(TOKEN_LIFETIME_DAYS)).timestamp(),
+        exp: (now + Duration::days(days)).timestamp(),
         jti: Uuid::new_v4(),
     };
     encode(

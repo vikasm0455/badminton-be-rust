@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 use crate::config::Config;
+use crate::native_push::NativePush;
 use crate::net::RateLimiter;
 use crate::push::Vapid;
 
@@ -36,6 +37,8 @@ pub struct AppState {
     pub db: PgPool,
     /// VAPID keypair for Web Push (generated on first boot, stored in app_config).
     pub vapid: Arc<Vapid>,
+    /// APNs/FCM senders for the native apps (env-gated; no-op when unconfigured).
+    pub native: Arc<NativePush>,
     /// Broadcast bus for SSE live updates.
     pub events: broadcast::Sender<LiveEvent>,
     /// Global per-IP API rate limiter (PRD §19.3: 100 req/min/IP).

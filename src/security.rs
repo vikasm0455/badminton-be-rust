@@ -20,6 +20,7 @@ pub mod event {
     pub const LOGIN_SUCCESS: &str = "login_success";
     pub const LOGIN_FAILED: &str = "login_failed";
     pub const ACCOUNT_LOCKED: &str = "account_locked";
+    pub const ACCOUNT_DELETED: &str = "account_deleted";
     pub const MEMBER_APPROVED: &str = "member_approved";
     pub const MEMBER_REJECTED: &str = "member_rejected";
     pub const MEMBER_DEACTIVATED: &str = "member_deactivated";

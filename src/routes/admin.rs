@@ -116,7 +116,9 @@ pub async fn deactivate_member(
     if res.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
-    revoke_all_for_user(&state, id).await; // invalidate all sessions immediately
+    revoke_all_for_user(&state, id).await; // invalidate all JWTs immediately
+    // Also kill native refresh chains — otherwise they'd resurrect on reactivate.
+    crate::tokens::revoke_all_for_user(&state, id).await.ok();
     security::log(&state, event::MEMBER_DEACTIVATED, Some(admin.id), None, json!({ "member": id })).await;
     Ok(Json(ApiResponse::message("Member deactivated.")))
 }

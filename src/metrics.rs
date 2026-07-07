@@ -30,10 +30,11 @@ lazy_static! {
         &["dependency"]
     ).unwrap();
 
-    // Web Push deliveries, labeled by result: "ok" | "failed" | "gone".
+    // Push deliveries by platform ("web" | "apns" | "fcm") and result
+    // ("ok" | "failed" | "gone").
     pub static ref PUSH_SENT_TOTAL: CounterVec = CounterVec::new(
-        Opts::new("push_sent_total", "Web Push deliveries by result"),
-        &["result"]
+        Opts::new("push_sent_total", "Push deliveries by platform and result"),
+        &["platform", "result"]
     ).unwrap();
 }
 
@@ -71,9 +72,9 @@ pub fn record_downstream(dependency: &str, status: &str, elapsed_secs: f64) {
         .observe(elapsed_secs);
 }
 
-/// Record one Web Push delivery outcome.
-pub fn record_push(result: &str) {
-    PUSH_SENT_TOTAL.with_label_values(&[result]).inc();
+/// Record one push delivery outcome for a platform (web | apns | fcm).
+pub fn record_push(platform: &str, result: &str) {
+    PUSH_SENT_TOTAL.with_label_values(&[platform, result]).inc();
 }
 
 pub fn metrics_handler() -> String {

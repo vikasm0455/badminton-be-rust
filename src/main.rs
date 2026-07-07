@@ -49,6 +49,7 @@ async fn main() {
     }
 
     let vapid = Arc::new(Vapid::load_or_create(&db, &config.vapid_subject).await);
+    let native = Arc::new(rallyup_api::native_push::NativePush::from_env());
     let (events, _) = broadcast::channel(256);
 
     let port = config.port;
@@ -58,6 +59,7 @@ async fn main() {
         redis,
         db,
         vapid,
+        native,
         events,
         rate_api: Arc::new(RateLimiter::new(100, Duration::from_secs(60))),
     };

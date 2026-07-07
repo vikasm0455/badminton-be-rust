@@ -115,6 +115,44 @@ struct SubRow {
     auth: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct DeviceRow {
+    id: Uuid,
+    platform: String,
+    token: String,
+}
+
+/// Deliver to native devices (APNs/FCM), deactivating dead tokens.
+async fn deliver_native(state: &AppState, devices: Vec<DeviceRow>, payload: &PushPayload) {
+    use crate::native_push::{SendResult, send_apns, send_fcm};
+    for d in devices {
+        let result = match d.platform.as_str() {
+            "apns" => send_apns(state, &d.token, payload).await,
+            "fcm" => send_fcm(state, &d.token, payload).await,
+            _ => SendResult::Skipped,
+        };
+        match result {
+            SendResult::Ok => {
+                crate::metrics::record_push(&d.platform, "ok");
+                let _ = sqlx::query("UPDATE device_tokens SET last_success_at = NOW() WHERE id = $1")
+                    .bind(d.id)
+                    .execute(&state.db)
+                    .await;
+            }
+            SendResult::Gone => {
+                crate::metrics::record_push(&d.platform, "gone");
+                tracing::info!(device = %d.id, platform = %d.platform, "native token gone — deactivating");
+                let _ = sqlx::query("UPDATE device_tokens SET active = false WHERE id = $1")
+                    .bind(d.id)
+                    .execute(&state.db)
+                    .await;
+            }
+            SendResult::Failed => crate::metrics::record_push(&d.platform, "failed"),
+            SendResult::Skipped => {} // channel unconfigured — not an outcome
+        }
+    }
+}
+
 /// Send to every member of the given groups (deduped across groups); `exclude`
 /// skips one user (e.g. the actor). `category` is checked against each user's
 /// notif_prefs (opt-out model).
@@ -141,7 +179,24 @@ pub fn notify_groups(state: &AppState, group_ids: Vec<Uuid>, payload: PushPayloa
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
+        let devices: Vec<DeviceRow> = sqlx::query_as(
+            "SELECT DISTINCT dt.id, dt.platform, dt.token
+             FROM device_tokens dt
+             JOIN users u ON u.id = dt.user_id
+             JOIN group_members gm ON gm.user_id = dt.user_id
+             WHERE dt.active = true AND u.status = 'active'
+               AND gm.group_id = ANY($1)
+               AND ($2::uuid IS NULL OR dt.user_id <> $2)
+               AND COALESCE((u.notif_prefs ->> $3)::boolean, true) = true",
+        )
+        .bind(&group_ids)
+        .bind(exclude)
+        .bind(&category)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
         deliver(&state, subs, &payload).await;
+        deliver_native(&state, devices, &payload).await;
     });
 }
 
@@ -167,7 +222,20 @@ pub fn notify_user(state: &AppState, user_id: Uuid, payload: PushPayload, catego
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
+        let devices: Vec<DeviceRow> = sqlx::query_as(
+            "SELECT dt.id, dt.platform, dt.token
+             FROM device_tokens dt
+             JOIN users u ON u.id = dt.user_id
+             WHERE dt.active = true AND dt.user_id = $1
+               AND COALESCE((u.notif_prefs ->> $2)::boolean, true) = true",
+        )
+        .bind(user_id)
+        .bind(&category)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
         deliver(&state, subs, &payload).await;
+        deliver_native(&state, devices, &payload).await;
     });
 }
 
@@ -183,11 +251,23 @@ pub fn notify_admins(state: &AppState, payload: PushPayload) {
              WHERE ps.active = true
                AND (u.role = 'admin' OR LOWER(u.email) = $1)",
         )
-        .bind(admin_email)
+        .bind(&admin_email)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        let devices: Vec<DeviceRow> = sqlx::query_as(
+            "SELECT dt.id, dt.platform, dt.token
+             FROM device_tokens dt
+             JOIN users u ON u.id = dt.user_id
+             WHERE dt.active = true
+               AND (u.role = 'admin' OR LOWER(u.email) = $1)",
+        )
+        .bind(&admin_email)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
         deliver(&state, subs, &payload).await;
+        deliver_native(&state, devices, &payload).await;
     });
 }
 
@@ -202,7 +282,7 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
         match build_message(state, &sub, &body) {
             Ok(message) => match client.send(message).await {
                 Ok(()) => {
-                    crate::metrics::record_push("ok");
+                    crate::metrics::record_push("web", "ok");
                     let _ = sqlx::query(
                         "UPDATE push_subscriptions SET last_success_at = NOW() WHERE id = $1",
                     )
@@ -211,7 +291,7 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
                     .await;
                 }
                 Err(WebPushError::EndpointNotFound | WebPushError::EndpointNotValid) => {
-                    crate::metrics::record_push("gone");
+                    crate::metrics::record_push("web", "gone");
                     tracing::info!(sub = %sub.id, "push endpoint gone — deactivating");
                     let _ = sqlx::query(
                         "UPDATE push_subscriptions SET active = false WHERE id = $1",
@@ -221,12 +301,12 @@ async fn deliver(state: &AppState, subs: Vec<SubRow>, payload: &PushPayload) {
                     .await;
                 }
                 Err(e) => {
-                    crate::metrics::record_push("failed");
+                    crate::metrics::record_push("web", "failed");
                     tracing::warn!(error = %e, sub = %sub.id, "push delivery failed");
                 }
             },
             Err(e) => {
-                crate::metrics::record_push("failed");
+                crate::metrics::record_push("web", "failed");
                 tracing::warn!(error = %e, "failed to build push message");
             }
         }

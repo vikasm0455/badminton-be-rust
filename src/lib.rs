@@ -6,6 +6,7 @@ pub mod error;
 pub mod jobs;
 pub mod metrics;
 pub mod models;
+pub mod native_push;
 pub mod net;
 pub mod notify;
 pub mod ocr;
@@ -15,6 +16,7 @@ pub mod routes;
 pub mod security;
 pub mod state;
 pub mod time;
+pub mod tokens;
 pub mod upload;
 
 use std::net::SocketAddr;
@@ -52,8 +54,9 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/auth/signup/verify", post(routes::auth::signup_verify))
         .route("/api/auth/login", post(routes::auth::login))
         .route("/api/auth/login/verify", post(routes::auth::login_verify))
+        .route("/api/auth/token/refresh", post(routes::auth::token_refresh))
         .route("/api/auth/logout", post(routes::auth::logout))
-        .route("/api/auth/me", get(routes::auth::me).patch(routes::auth::update_me))
+        .route("/api/auth/me", get(routes::auth::me).patch(routes::auth::update_me).delete(routes::auth::delete_me))
         // ---- groups ----------------------------------------------------------
         .route("/api/groups", get(routes::groups::list_mine).post(routes::groups::create_group))
         .route("/api/groups/active", put(routes::groups::set_active))
@@ -108,6 +111,10 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route(
             "/api/push/subscribe",
             post(routes::push::subscribe).delete(routes::push::unsubscribe),
+        )
+        .route(
+            "/api/push/device",
+            post(routes::push::register_device).delete(routes::push::unregister_device),
         )
         // ---- config --------------------------------------------------------
         .route(

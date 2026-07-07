@@ -87,11 +87,19 @@ async fn tick(state: &AppState) -> Result<(), ApiError> {
         tracing::info!(removed, "midnight credential cleanup");
     }
 
-    // Security event pruning (02:00, >90 days).
+    // Security event pruning (02:00, >90 days) + spent refresh-token rows.
     if due(state, "security_prune", NaiveTime::from_hms_opt(2, 0, 0).unwrap(), now_t, today).await {
         let _ = sqlx::query("DELETE FROM security_events WHERE created_at < NOW() - INTERVAL '90 days'")
             .execute(&state.db)
             .await;
+        let _ = sqlx::query(
+            "DELETE FROM refresh_tokens
+             WHERE expires_at < NOW() - INTERVAL '7 days'
+                OR revoked_at < NOW() - INTERVAL '7 days'
+                OR used_at < NOW() - INTERVAL '7 days'",
+        )
+        .execute(&state.db)
+        .await;
         stamp(state, "security_prune", today).await;
     }
 

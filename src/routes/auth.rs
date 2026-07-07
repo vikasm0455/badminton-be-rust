@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderName;
+use axum::http::{HeaderMap, HeaderName};
 use axum::http::header::SET_COOKIE;
 use axum::response::AppendHeaders;
 use redis::AsyncCommands;
@@ -8,14 +8,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::auth::{SessionUser, auth_cookie, clear_auth_cookie, issue_token, revoke_jti};
+use crate::auth::{
+    SessionUser, auth_cookie, clear_auth_cookie, issue_token, issue_token_for, revoke_all_for_user,
+    revoke_jti,
+};
 use crate::error::ApiError;
 use crate::models::{ApiResponse, MeProfile};
 use crate::net::ClientIp;
 use crate::otp::{self, OtpPurpose, VerifyResult};
 use crate::security::{self, event};
 use crate::state::AppState;
-use crate::{email, notify};
+use crate::{email, notify, tokens};
+
+/// Native apps (iOS/Android) send this header; they get bearer tokens in the
+/// response body on top of the (harmless to them) session cookie.
+fn is_native_client(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-client")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("native"))
+}
 
 const MAX_EMAIL_LEN: usize = 254;
 
@@ -117,6 +129,7 @@ pub struct VerifyReq {
 pub async fn signup_verify(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Json(req): Json<VerifyReq>,
 ) -> Result<CookieResp<LoginResult>, ApiError> {
     let email = normalize_email(&req.email);
@@ -173,9 +186,22 @@ pub async fn signup_verify(
     // Log them straight in — verifying the OTP already proved the email.
     let token = issue_token(user_id, "member", &state.config.jwt_secret)?;
     let cookie = auth_cookie(&token, state.config.cookie_secure);
+    let (access_token, refresh_token) = if is_native_client(&headers) {
+        (
+            Some(issue_token_for(user_id, "member", &state.config.jwt_secret, tokens::NATIVE_ACCESS_DAYS)?),
+            Some(tokens::issue(&state, user_id, None).await?),
+        )
+    } else {
+        (None, None)
+    };
     Ok((
         AppendHeaders([(SET_COOKIE, cookie)]),
-        Json(ApiResponse::ok(LoginResult { status: "active".into(), is_admin: false })),
+        Json(ApiResponse::ok(LoginResult {
+            status: "active".into(),
+            is_admin: false,
+            access_token,
+            refresh_token,
+        })),
     ))
 }
 
@@ -233,11 +259,17 @@ pub async fn login(
 pub struct LoginResult {
     pub status: String,
     pub is_admin: bool,
+    /// Present only for native clients (X-Client: native).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 pub async fn login_verify(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Json(req): Json<VerifyReq>,
 ) -> Result<CookieResp<LoginResult>, ApiError> {
     let email = normalize_email(&req.email);
@@ -297,22 +329,180 @@ pub async fn login_verify(
     let is_admin = role == "admin"
         || state.config.admin_email.as_deref() == Some(user_email.to_lowercase().as_str());
 
+    let (access_token, refresh_token) = if is_native_client(&headers) {
+        (
+            Some(issue_token_for(id, &role, &state.config.jwt_secret, tokens::NATIVE_ACCESS_DAYS)?),
+            Some(tokens::issue(&state, id, None).await?),
+        )
+    } else {
+        (None, None)
+    };
+
     Ok((
         AppendHeaders([(SET_COOKIE, cookie)]),
-        Json(ApiResponse::ok(LoginResult { status, is_admin })),
+        Json(ApiResponse::ok(LoginResult { status, is_admin, access_token, refresh_token })),
     ))
+}
+
+// ---- native token refresh ----------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RefreshReq {
+    pub refresh_token: String,
+}
+
+#[derive(Serialize)]
+pub struct RefreshResult {
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
+/// Exchange a refresh token for a fresh access JWT + rotated refresh token.
+/// A replayed (already-used) token revokes its whole family — see tokens.rs.
+pub async fn token_refresh(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<RefreshReq>,
+) -> Result<Json<ApiResponse<RefreshResult>>, ApiError> {
+    let rotated = tokens::rotate(&state, req.refresh_token.trim()).await?;
+    let Some((user_id, new_refresh)) = rotated else {
+        security::log(&state, event::LOGIN_FAILED, None, Some(ip), json!({ "via": "refresh" })).await;
+        return Err(ApiError::Unauthorized);
+    };
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT role, status FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let (role, status) = row.ok_or(ApiError::Unauthorized)?;
+    if status != "active" {
+        return Err(ApiError::Unauthorized);
+    }
+    let access_token =
+        issue_token_for(user_id, &role, &state.config.jwt_secret, tokens::NATIVE_ACCESS_DAYS)?;
+    Ok(Json(ApiResponse::ok(RefreshResult { access_token, refresh_token: new_refresh })))
 }
 
 // ---- session ---------------------------------------------------------------
 
+#[derive(Deserialize, Default)]
+pub struct LogoutReq {
+    /// Native clients pass their refresh token so the chain dies with the session.
+    pub refresh_token: Option<String>,
+}
+
 pub async fn logout(
     State(state): State<AppState>,
     session: SessionUser,
+    body: Option<Json<LogoutReq>>,
 ) -> Result<CookieResp<()>, ApiError> {
     revoke_jti(&state, session.jti, session.exp).await;
+    if let Some(Json(b)) = body {
+        if let Some(rt) = b.refresh_token.as_deref() {
+            tokens::revoke(&state, rt.trim()).await.ok();
+        }
+    }
     Ok((
         AppendHeaders([(SET_COOKIE, clear_auth_cookie(state.config.cookie_secure))]),
         Json(ApiResponse::message("Logged out.")),
+    ))
+}
+
+/// Delete the caller's account (Apple guideline 5.1.1(v)). Personal data is
+/// hard-deleted (kCal, own logins + screenshots, push registrations, tokens);
+/// history rows survive anonymized so group stats stay coherent. Groups where
+/// they were the only admin get their earliest member promoted; groups where
+/// they were the only member dissolve.
+pub async fn delete_me(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    session: SessionUser,
+) -> Result<CookieResp<()>, ApiError> {
+    let uid = session.id;
+    let mut tx = state.db.begin().await?;
+
+    // Sole-member groups dissolve entirely (CASCADE cleans their data).
+    sqlx::query(
+        "DELETE FROM groups g
+         WHERE EXISTS (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1)
+           AND (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) = 1",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?;
+
+    // Groups where I'm the only admin (with other members): promote the
+    // earliest-joined other member so the group isn't orphaned.
+    sqlx::query(
+        "UPDATE group_members gm SET role = 'admin'
+         FROM (
+             SELECT DISTINCT ON (g2.group_id) g2.group_id, g2.user_id
+             FROM group_members g2
+             WHERE g2.user_id <> $1
+               AND g2.group_id IN (
+                   SELECT m.group_id FROM group_members m
+                   WHERE m.user_id = $1 AND m.role = 'admin'
+                     AND NOT EXISTS (SELECT 1 FROM group_members o
+                                     WHERE o.group_id = m.group_id AND o.role = 'admin' AND o.user_id <> $1))
+             ORDER BY g2.group_id, g2.joined_at ASC
+         ) pick
+         WHERE gm.group_id = pick.group_id AND gm.user_id = pick.user_id",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("DELETE FROM group_members WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+
+    // Personal data: hard-delete.
+    let shots: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT screenshot_path FROM court_credentials WHERE posted_by = $1")
+            .bind(uid)
+            .fetch_all(&mut *tx)
+            .await?;
+    sqlx::query("DELETE FROM court_credentials WHERE posted_by = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM kcal_logs WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM push_subscriptions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM device_tokens WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+
+    // Kill invites addressed to the departing email AND invites they sent
+    // (nobody should accept an invite from "Deleted member").
+    sqlx::query(
+        "UPDATE group_invites SET revoked_at = NOW()
+         WHERE (LOWER(email) = (SELECT LOWER(email) FROM users WHERE id = $1) OR invited_by = $1)
+           AND accepted_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?;
+
+    // Anonymize the user row (frees the email for a future re-signup; history
+    // rows keep a coherent author).
+    sqlx::query(
+        "UPDATE users SET display_name = 'Deleted member',
+                          email = 'deleted-' || id || '@rallyup.invalid',
+                          status = 'deactivated', notif_prefs = '{}'::jsonb,
+                          active_group_id = NULL
+         WHERE id = $1",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    for (p,) in shots.iter() {
+        if let Some(p) = p {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+    }
+    revoke_all_for_user(&state, uid).await; // invalidate outstanding JWTs
+    security::log(&state, event::ACCOUNT_DELETED, Some(uid), Some(ip), json!({})).await;
+    state.broadcast(crate::state::LiveEvent::CredentialsChanged);
+
+    Ok((
+        AppendHeaders([(SET_COOKIE, clear_auth_cookie(state.config.cookie_secure))]),
+        Json(ApiResponse::message("Your account and personal data have been deleted.")),
     ))
 }
 
