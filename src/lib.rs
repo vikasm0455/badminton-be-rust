@@ -64,6 +64,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
             "/api/groups/current",
             get(routes::groups::current_group).put(routes::groups::rename_group),
         )
+        .route("/api/groups/venue", put(routes::groups::set_venue))
         .route("/api/groups/leave", post(routes::groups::leave_group))
         .route(
             "/api/groups/members/:id",

@@ -191,6 +191,9 @@ pub struct GroupDetail {
     pub id: Uuid,
     pub name: String,
     pub my_role: String,
+    pub venue_name: String,
+    pub court_min: i16,
+    pub court_max: i16,
     pub members: Vec<GroupMemberRow>,
 }
 
@@ -199,10 +202,11 @@ pub async fn current_group(
     user: AuthUser,
 ) -> Result<Json<ApiResponse<GroupDetail>>, ApiError> {
     let ctx = active_group(&state, user.id).await?;
-    let name: String = sqlx::query_scalar("SELECT name FROM groups WHERE id = $1")
-        .bind(ctx.group_id)
-        .fetch_one(&state.db)
-        .await?;
+    let (name, venue_name, court_min, court_max): (String, String, i16, i16) =
+        sqlx::query_as("SELECT name, venue_name, court_min, court_max FROM groups WHERE id = $1")
+            .bind(ctx.group_id)
+            .fetch_one(&state.db)
+            .await?;
     let members: Vec<GroupMemberRow> = sqlx::query_as(
         "SELECT u.id, u.display_name, gm.role, gm.joined_at
          FROM group_members gm JOIN users u ON u.id = gm.user_id
@@ -216,8 +220,56 @@ pub async fn current_group(
         id: ctx.group_id,
         name,
         my_role: ctx.role,
+        venue_name,
+        court_min,
+        court_max,
         members,
     })))
+}
+
+
+/// Per-group court range for validation — every venue numbers courts its own way.
+pub async fn court_range(state: &AppState, group_id: Uuid) -> Result<(i16, i16), ApiError> {
+    let row: (i16, i16) = sqlx::query_as("SELECT court_min, court_max FROM groups WHERE id = $1")
+        .bind(group_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(row)
+}
+
+#[derive(Deserialize)]
+pub struct SetVenueReq {
+    pub venue_name: Option<String>,
+    pub court_min: i16,
+    pub court_max: i16,
+}
+
+/// Admin-only: set the group's venue name + court number range.
+pub async fn set_venue(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<SetVenueReq>,
+) -> Result<Json<ApiResponse<GroupDetail>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
+    if req.court_min < 1 || req.court_max < req.court_min || req.court_max > 500 {
+        return Err(ApiError::BadRequest(
+            "Court range must satisfy 1 \u{2264} first \u{2264} last \u{2264} 500.".into(),
+        ));
+    }
+    let venue = req.venue_name.as_deref().map(str::trim).unwrap_or("");
+    sqlx::query("UPDATE groups SET venue_name = $1, court_min = $2, court_max = $3 WHERE id = $4")
+        .bind(venue)
+        .bind(req.court_min)
+        .bind(req.court_max)
+        .bind(ctx.group_id)
+        .execute(&state.db)
+        .await?;
+    crate::security::log(
+        &state, "VENUE_UPDATED", Some(user.id), None,
+        serde_json::json!({ "court_min": req.court_min, "court_max": req.court_max }),
+    )
+    .await;
+    current_group(State(state), user).await
 }
 
 #[derive(Deserialize)]

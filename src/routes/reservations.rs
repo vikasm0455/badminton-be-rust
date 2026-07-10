@@ -151,8 +151,11 @@ pub async fn create(
     Json(req): Json<CreateReservationReq>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
     let ctx = active_group(&state, user.id).await?;
-    if !(1..=53).contains(&req.court_number) {
-        return Err(ApiError::BadRequest("Court number must be between 1 and 53.".into()));
+    let (cmin, cmax) = crate::routes::groups::court_range(&state, ctx.group_id).await?;
+    if !(cmin..=cmax).contains(&req.court_number) {
+        return Err(ApiError::BadRequest(format!(
+            "Court number must be between {cmin} and {cmax} at your venue."
+        )));
     }
     if !matches!(req.court_type.as_str(), "full" | "half") {
         return Err(ApiError::BadRequest("court type must be full or half".into()));
@@ -635,8 +638,11 @@ pub async fn edit(
     let dup = || ApiError::Conflict("That court and queue slot already has an active reservation.".into());
 
     if let Some(c) = req.court_number {
-        if !(1..=53).contains(&c) {
-            return Err(ApiError::BadRequest("Court number must be between 1 and 53.".into()));
+        let (cmin, cmax) = crate::routes::groups::court_range(&state, ctx.group_id).await?;
+        if !(cmin..=cmax).contains(&c) {
+            return Err(ApiError::BadRequest(format!(
+                "Court number must be between {cmin} and {cmax} at your venue."
+            )));
         }
         match sqlx::query("UPDATE court_reservations SET court_number = $1 WHERE id = $2")
             .bind(c)

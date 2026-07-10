@@ -15,7 +15,7 @@ pub struct OcrPair {
     pub password: String,
 }
 
-const PROMPT: &str = "This image shows one or more Bintang Badminton court logins. \
+const PROMPT: &str = "This image shows one or more badminton court kiosk logins (from a kiosk screen or a handwritten note). \
 A login is a Name and its Password. They may appear as a kiosk screen (Name in blue, Password in red) \
 or as handwriting/notes with each login on its own line, e.g. 'Suchi - lion16' or 'Shalu: bear48'. \
 Extract EVERY login you can read, preserving order. \
@@ -149,7 +149,7 @@ pub struct BoardCourt {
     pub queue: Vec<String>,
 }
 
-const BOARD_PROMPT: &str = "This is a photo of the Bintang Badminton facility court status board. \
+const BOARD_PROMPT: &str = "This is a photo of a badminton facility's court status board. \
 Each court panel shows a court number, a 'Minutes Left' number, a 'Current Players' line, and a numbered 'Queue'. \
 For EVERY court panel you can read, extract: court_number (integer), minutes_left (integer, or null if not shown), \
 current_players (array of the individual player names on the Current Players line, splitting on dashes/commas), \
