@@ -10,7 +10,7 @@ lazy_static! {
 
     pub static ref HTTP_REQUESTS_TOTAL: CounterVec = CounterVec::new(
         Opts::new("http_requests_total", "Total HTTP requests"),
-        &["method", "endpoint", "status"]
+        &["method", "endpoint", "status", "client"]
     ).unwrap();
 
     pub static ref HTTP_REQUEST_DURATION: HistogramVec = HistogramVec::new(
@@ -36,6 +36,20 @@ lazy_static! {
         Opts::new("push_sent_total", "Push deliveries by platform and result"),
         &["platform", "result"]
     ).unwrap();
+
+    // Refresh-token rotation outcomes — the native-session security signal.
+    // result: ok | grace | race_grace | reuse_revoked | rejected
+    pub static ref TOKEN_REFRESH_TOTAL: CounterVec = CounterVec::new(
+        Opts::new("token_refresh_total", "Refresh-token rotation outcomes"),
+        &["result"]
+    ).unwrap();
+
+    // Product usage by feature event and client (web | native). One counter,
+    // one label pair — every new feature MUST record its key action here.
+    pub static ref FEATURE_EVENTS_TOTAL: CounterVec = CounterVec::new(
+        Opts::new("feature_events_total", "Key product actions by event and client"),
+        &["event", "client"]
+    ).unwrap();
 }
 
 /// Register all collectors exactly once per process (idempotent — safe to call
@@ -48,14 +62,16 @@ pub fn register_metrics() {
         REGISTRY.register(Box::new(DOWNSTREAM_REQUESTS_TOTAL.clone())).ok();
         REGISTRY.register(Box::new(DOWNSTREAM_REQUEST_DURATION.clone())).ok();
         REGISTRY.register(Box::new(PUSH_SENT_TOTAL.clone())).ok();
+        REGISTRY.register(Box::new(TOKEN_REFRESH_TOTAL.clone())).ok();
+        REGISTRY.register(Box::new(FEATURE_EVENTS_TOTAL.clone())).ok();
     });
 }
 
 /// Record one HTTP request's count and latency.
-pub fn record_request(method: &str, endpoint: &str, status: u16, elapsed_secs: f64) {
+pub fn record_request(method: &str, endpoint: &str, status: u16, elapsed_secs: f64, client: &str) {
     let status = status.to_string();
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[method, endpoint, &status])
+        .with_label_values(&[method, endpoint, &status, client])
         .inc();
     HTTP_REQUEST_DURATION
         .with_label_values(&[method, endpoint])
@@ -75,6 +91,17 @@ pub fn record_downstream(dependency: &str, status: &str, elapsed_secs: f64) {
 /// Record one push delivery outcome for a platform (web | apns | fcm).
 pub fn record_push(platform: &str, result: &str) {
     PUSH_SENT_TOTAL.with_label_values(&[platform, result]).inc();
+}
+
+/// Record one refresh-token rotation outcome.
+pub fn record_token_refresh(result: &str) {
+    TOKEN_REFRESH_TOTAL.with_label_values(&[result]).inc();
+}
+
+/// Record a key product action (feature_events_total). `client` is
+/// "native" when the request carried `X-Client: native`, else "web".
+pub fn record_feature(event: &str, client: &str) {
+    FEATURE_EVENTS_TOTAL.with_label_values(&[event, client]).inc();
 }
 
 pub fn metrics_handler() -> String {

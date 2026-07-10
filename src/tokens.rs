@@ -88,19 +88,25 @@ pub async fn rotate(state: &AppState, presented: &str) -> Result<Option<(Uuid, S
     .bind(hash(presented))
     .fetch_optional(&state.db)
     .await?;
-    let Some(row) = row else { return Ok(None) };
+    let Some(row) = row else {
+        crate::metrics::record_token_refresh("rejected");
+        return Ok(None);
+    };
 
     if row.revoked_at.is_some() || row.expires_at <= Utc::now() || row.user_status != "active" {
+        crate::metrics::record_token_refresh("rejected");
         return Ok(None);
     }
     if let Some(used) = row.used_at {
         if (Utc::now() - used).num_seconds() <= reuse_grace_secs() {
             // Network-retry grace: same token again right after rotation.
             let next = issue(state, row.user_id, Some(row.family)).await?;
+            crate::metrics::record_token_refresh("grace");
             return Ok(Some((row.user_id, next)));
         }
         revoke_family(state, row.family).await?;
         tracing::warn!(user = %row.user_id, "refresh token REUSE detected — family revoked");
+        crate::metrics::record_token_refresh("reuse_revoked");
         return Ok(None);
     }
 
@@ -112,10 +118,12 @@ pub async fn rotate(state: &AppState, presented: &str) -> Result<Option<(Uuid, S
         .await?;
     if claimed.rows_affected() == 0 {
         let next = issue(state, row.user_id, Some(row.family)).await?;
+        crate::metrics::record_token_refresh("race_grace");
         return Ok(Some((row.user_id, next)));
     }
 
     let next = issue(state, row.user_id, Some(row.family)).await?;
+    crate::metrics::record_token_refresh("ok");
     Ok(Some((row.user_id, next)))
 }
 

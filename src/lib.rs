@@ -162,8 +162,43 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
 
 /// Record per-request metrics using the matched route template as the endpoint
 /// label (bounded cardinality), not the raw path.
+/// Map successful requests to product feature events (feature_events_total).
+/// Every new user-facing endpoint gets a row here — that's the metrics rule.
+fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
+    Some(match (method, endpoint) {
+        ("POST", "/api/auth/signup/verify") => "signup_completed",
+        ("POST", "/api/auth/login/verify") => "login_completed",
+        ("POST", "/api/auth/token/refresh") => "session_refreshed",
+        ("DELETE", "/api/auth/me") => "account_deleted",
+        ("POST", "/api/polls") => "poll_created",
+        ("PUT", "/api/polls/:id/vote") => "vote_cast",
+        ("POST", "/api/polls/:id/attendance") => "attendance_confirmed",
+        ("POST", "/api/reservations") => "court_logged",
+        ("PUT", "/api/reservations/:id") => "court_edited",
+        ("PUT", "/api/reservations/:id/complete") => "court_completed",
+        ("POST", "/api/reservations/scan-board") => "board_scanned",
+        ("POST", "/api/credentials") => "login_posted",
+        ("POST", "/api/credentials/ocr") => "login_ocr",
+        ("PUT", "/api/credentials/:id/shares") => "shares_updated",
+        ("POST", "/api/groups") => "group_created",
+        ("PUT", "/api/groups/active") => "group_switched",
+        ("POST", "/api/groups/invites") => "invite_sent",
+        ("POST", "/api/invites/:id/accept") => "invite_accepted",
+        ("PUT", "/api/groups/venue") => "venue_updated",
+        ("POST", "/api/kcal") => "kcal_logged",
+        ("POST", "/api/push/device") => "device_registered",
+        _ => return None,
+    })
+}
+
 async fn track_metrics(req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
+    let client = if req
+        .headers()
+        .get("x-client")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("native"))
+    { "native" } else { "web" };
     let endpoint = req
         .extensions()
         .get::<MatchedPath>()
@@ -172,7 +207,13 @@ async fn track_metrics(req: Request, next: Next) -> Response {
     let start = std::time::Instant::now();
     let resp = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::record_request(&method, &endpoint, resp.status().as_u16(), elapsed);
+    let status = resp.status().as_u16();
+    metrics::record_request(&method, &endpoint, status, elapsed, client);
+    if (200..300).contains(&status) {
+        if let Some(event) = feature_event(&method, &endpoint) {
+            metrics::record_feature(event, client);
+        }
+    }
     resp
 }
 
