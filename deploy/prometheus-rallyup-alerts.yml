@@ -1,0 +1,37 @@
+# RallyUp alert rules — drop into Prometheus rule_files (or recreate as
+# Grafana alerts if you alert from Grafana instead).
+groups:
+  - name: rallyup
+    rules:
+      # Any replay of an already-used refresh token beyond the retry grace
+      # window means someone presented a stolen token. Should be exactly zero.
+      - alert: RefreshTokenReuseDetected
+        expr: increase(token_refresh_total{result="reuse_revoked"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Refresh-token reuse detected ({{ $value }} in 15m)"
+          description: "A revoked/used refresh token was replayed — possible stolen session. The token family is already revoked server-side; investigate security_events for the user."
+
+      # Push deliveries failing hard (excluding dead-token cleanup).
+      - alert: PushDeliveryFailing
+        expr: |
+          sum(increase(push_sent_total{result="failed"}[30m]))
+            / clamp_min(sum(increase(push_sent_total[30m])), 1) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than half of push deliveries failing"
+          description: "Check APNs/FCM credentials (expired .p8 / service account) and provider status."
+
+      # API latency regression on the hot mobile paths.
+      - alert: MobileApiSlow
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~"/api/(polls|reservations|credentials)/today"}[10m]))) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 over 1s on today-endpoints"
