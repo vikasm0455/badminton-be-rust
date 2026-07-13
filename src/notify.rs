@@ -16,6 +16,7 @@ pub mod cat {
     pub const RESERVATIONS: &str = "reservations";
     pub const TIMERS: &str = "timers";
     #[allow(dead_code)]
+    pub const INVITES: &str = "invites";
     pub const ADMIN: &str = "admin";
     pub const ACCOUNT: &str = "account";
 }
@@ -166,6 +167,23 @@ pub fn operator_alert(state: &AppState, text: &str) {
     notify_admins(
         state,
         PushPayload::new("⚠️ RallyUp alert", text.to_string(), "/admin/security", "operator"),
+    );
+}
+
+/// Someone with a RallyUp account was invited to a group — tell them on
+/// their devices (the email goes out separately, and non-account invitees
+/// have nothing to push to).
+pub fn group_invited(state: &AppState, invitee: Uuid, group_name: &str, by_name: &str) {
+    notify_user(
+        state,
+        invitee,
+        PushPayload::new(
+            "🏸 Group invite",
+            &format!("{by_name} invited you to {group_name}"),
+            "/groups?invites=1",
+            "invite",
+        ),
+        cat::INVITES,
     );
 }
 

@@ -495,6 +495,16 @@ pub async fn send_invite(
     .bind(user.id)
     .fetch_one(&state.db)
     .await?;
+
+    // Push to the invitee if they already have an account (opt-out category).
+    let invitee: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE LOWER(email) = $1 AND status = 'active'")
+            .bind(&invite_email)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some((invitee_id,)) = invitee {
+        crate::notify::group_invited(&state, invitee_id, &group_name, &inviter);
+    }
     email::send_group_invite(&state, &invite_email, &group_name, &inviter).await.ok();
 
     list_group_invites_inner(&state, ctx.group_id).await.map(|rows| Json(ApiResponse::ok(rows)))
