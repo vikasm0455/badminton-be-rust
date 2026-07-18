@@ -80,6 +80,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/invites/:id/decline", post(routes::groups::decline_invite))
         // ---- polls ---------------------------------------------------------
         .route("/api/polls/today", get(routes::polls::today))
+        .route("/api/polls/tonight", get(routes::polls::tonight))
         .route("/api/polls/history", get(routes::polls::history))
         .route("/api/polls", post(routes::polls::create_poll))
         .route("/api/polls/:id", get(routes::polls::get_poll).delete(routes::polls::delete_poll))
@@ -98,6 +99,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/reservations/today", get(routes::reservations::today))
         .route("/api/reservations/stream", get(routes::stream::reservations_stream))
         .route("/api/reservations/scan-board", post(routes::reservations::scan_board))
+        .route("/api/reservations/resolve-group", post(routes::reservations::resolve_group))
         .route("/api/reservations", post(routes::reservations::create))
         .route("/api/reservations/credentials/:id/unlock", put(routes::reservations::unlock_credential))
         .route("/api/reservations/:id", put(routes::reservations::edit))

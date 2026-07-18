@@ -33,23 +33,36 @@ pub struct CredentialView {
     pub is_mine: bool,
     /// Groups this login is shared with — populated only when is_mine.
     pub shared_group_ids: Vec<Uuid>,
+    /// Name of the group whose court is using this login — revealed only when
+    /// the viewer belongs to that group (the owner always does).
+    pub in_use_group_name: Option<String>,
+    /// In use by a group the viewer is NOT in — court/group withheld.
+    pub in_use_elsewhere: bool,
 }
 
 /// Today's logins visible in the caller's ACTIVE group: everything shared with
 /// that group, plus the caller's own posts (even if unshared here, so they can
 /// still manage them).
+#[derive(Deserialize)]
+pub struct TodayQuery {
+    /// "all" → logins from every group the caller belongs to (log-court flow).
+    pub scope: Option<String>,
+}
+
 pub async fn today(
     State(state): State<AppState>,
     user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<TodayQuery>,
 ) -> Result<Json<ApiResponse<Vec<CredentialView>>>, ApiError> {
-    let ctx = active_group(&state, user.id).await?;
+    let all_groups = q.scope.as_deref() == Some("all");
+    let scope_group = if all_groups { None } else { Some(active_group(&state, user.id).await?.group_id) };
     let game_date = time::today();
     let clears_at = time::la_datetime_to_utc(
         game_date,
         chrono::NaiveTime::from_hms_opt(23, 59, 0).unwrap(),
     );
 
-    let rows: Vec<(Uuid, String, String, Uuid, String, DateTime<Utc>, Option<String>, Option<i16>)> =
+    let rows: Vec<(Uuid, String, String, Uuid, String, DateTime<Utc>, Option<String>, Option<i16>, Option<Uuid>)> =
         sqlx::query_as(
             "SELECT c.id, c.bintang_name, c.bintang_password, c.posted_by,
                     u.display_name, c.posted_at, c.screenshot_path,
@@ -58,19 +71,36 @@ pub async fn today(
                               OR EXISTS (SELECT 1 FROM reservation_credentials rc
                                          WHERE rc.reservation_id = r.id AND rc.credential_id = c.id))
                          AND r.status = 'active' AND r.expiry_at > NOW()
-                       ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
+                       ORDER BY r.start_at DESC LIMIT 1) AS in_use_court,
+                    (SELECT r.group_id FROM court_reservations r
+                       WHERE (r.credential_id = c.id
+                              OR EXISTS (SELECT 1 FROM reservation_credentials rc
+                                         WHERE rc.reservation_id = r.id AND rc.credential_id = c.id))
+                         AND r.status = 'active' AND r.expiry_at > NOW()
+                       ORDER BY r.start_at DESC LIMIT 1) AS in_use_group
              FROM court_credentials c JOIN users u ON u.id = c.posted_by
              WHERE c.game_date = $1
                AND (c.posted_by = $2
                     OR EXISTS (SELECT 1 FROM credential_shares s
-                               WHERE s.credential_id = c.id AND s.group_id = $3))
+                               WHERE s.credential_id = c.id
+                                 AND ($3::uuid IS NULL OR s.group_id = $3)
+                                 AND EXISTS (SELECT 1 FROM group_members gm
+                                             WHERE gm.group_id = s.group_id AND gm.user_id = $2)))
              ORDER BY c.posted_at ASC",
         )
         .bind(game_date)
         .bind(user.id)
-        .bind(ctx.group_id)
+        .bind(scope_group)
         .fetch_all(&state.db)
         .await?;
+
+    // Viewer's groups (id -> name) for in-use disclosure decisions.
+    let my_groups: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT g.id, g.name FROM groups g JOIN group_members gm ON gm.group_id = g.id WHERE gm.user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await?;
 
     // Share lists for the caller's own logins (one query for all of them).
     let mine: Vec<Uuid> = rows.iter().filter(|r| r.3 == user.id).map(|r| r.0).collect();
@@ -87,12 +117,20 @@ pub async fn today(
 
     let cards = rows
         .into_iter()
-        .map(|(id, name, pass, posted_by, posted_by_name, posted_at, shot, court)| {
+        .map(|(id, name, pass, posted_by, posted_by_name, posted_at, shot, court, use_group)| {
             let is_mine = posted_by == user.id;
-            let shared_group_ids = if is_mine {
+            let shared_group_ids: Vec<Uuid> = if is_mine {
                 shares.iter().filter(|(c, _)| *c == id).map(|(_, g)| *g).collect()
             } else {
                 Vec::new()
+            };
+            // Disclose the using group's court + name only to its members
+            // (the owner is always a member of every group they shared to).
+            let visible = use_group.map(|g| my_groups.iter().any(|(gid, _)| *gid == g)).unwrap_or(false);
+            let in_use_group_name = if visible {
+                use_group.and_then(|g| my_groups.iter().find(|(gid, _)| *gid == g).map(|(_, n)| n.clone()))
+            } else {
+                None
             };
             CredentialView {
                 id,
@@ -103,10 +141,12 @@ pub async fn today(
                 posted_at,
                 has_screenshot: shot.is_some(),
                 in_use: court.is_some(),
-                in_use_court: court,
+                in_use_court: if visible { court } else { None },
                 clears_at,
                 is_mine,
                 shared_group_ids,
+                in_use_group_name,
+                in_use_elsewhere: court.is_some() && !visible,
             }
         })
         .collect();
@@ -207,7 +247,7 @@ pub async fn post_credential(
         .await?;
     notify::credential_posted(&state, share_groups.clone(), user.id, &poster_name.0);
 
-    let cards = today(State(state.clone()), user).await?;
+    let cards = today(State(state.clone()), user, axum::extract::Query(TodayQuery { scope: None })).await?;
     let card = cards
         .0
         .data

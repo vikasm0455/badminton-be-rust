@@ -21,18 +21,19 @@ pub mod cat {
     pub const ACCOUNT: &str = "account";
 }
 
-pub fn poll_created(state: &AppState, group_id: Uuid, creator: Option<Uuid>, by_name: &str, time: &str, auto: bool) {
+pub fn poll_created(state: &AppState, group_id: Uuid, creator: Option<Uuid>, by_name: &str, time: &str, auto: bool, group_name: &str) {
+    // Multi-group players get ambiguous pushes without the group in the title.
     let payload = if auto {
         PushPayload::new(
-            "🏸 Today's badminton poll is live",
+            format!("🏸 {group_name} · today's poll is live"),
             "Vote now!",
             "/home",
             "poll",
         )
     } else {
         PushPayload::new(
-            "🏸 New poll for today",
-            format!("{by_name} created a poll @ {time} — vote now!"),
+            format!("🏸 {group_name} · new poll"),
+            format!("{by_name} proposed {time} — vote now!"),
             "/home",
             "poll",
         )

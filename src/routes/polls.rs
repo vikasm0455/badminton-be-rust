@@ -133,18 +133,36 @@ pub async fn today(
     Ok(Json(ApiResponse::ok(view)))
 }
 
-/// The poll's group, verified against the caller's active group.
+/// The poll's group, verified by MEMBERSHIP (not active group) — multi-group
+/// players vote in any of their groups without switching.
 async fn poll_in_my_group(state: &AppState, poll_id: Uuid, user_id: Uuid) -> Result<Uuid, ApiError> {
-    let ctx = active_group(state, user_id).await?;
     let group: Option<(Option<Uuid>,)> = sqlx::query_as("SELECT group_id FROM polls WHERE id = $1")
         .bind(poll_id)
         .fetch_optional(&state.db)
         .await?;
     let (group,) = group.ok_or(ApiError::NotFound)?;
-    if group != Some(ctx.group_id) {
-        return Err(ApiError::NotFound); // don't reveal other groups' polls
-    }
-    Ok(ctx.group_id)
+    let group = group.ok_or(ApiError::NotFound)?;
+    let member: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2",
+    )
+    .bind(group)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    member.ok_or(ApiError::NotFound)?; // don't reveal other groups' polls
+    Ok(group)
+}
+
+/// The caller's role in a specific group (None = not a member).
+async fn role_in_group(state: &AppState, group_id: Uuid, user_id: Uuid) -> Result<Option<String>, ApiError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(row.map(|(r,)| r))
 }
 
 pub async fn get_poll(
@@ -214,7 +232,12 @@ pub async fn create_poll(
     let view = load_poll_view(&state, poll_id, user.id, ctx.group_id).await?.ok_or(ApiError::NotFound)?;
     state.broadcast(LiveEvent::PollChanged { poll_id });
     if game_date == time::today() {
-        notify::poll_created(&state, ctx.group_id, Some(user.id), &view.created_by_name, &view.proposed_time, false);
+        let group_name: String = sqlx::query_scalar("SELECT name FROM groups WHERE id = $1")
+            .bind(ctx.group_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|_| "RallyUp".into());
+        notify::poll_created(&state, ctx.group_id, Some(user.id), &view.created_by_name, &view.proposed_time, false, &group_name);
     }
     Ok(Json(ApiResponse::ok(view)))
 }
@@ -310,13 +333,13 @@ pub async fn confirm_attendance(
     Json(req): Json<AttendanceReq>,
 ) -> Result<Json<ApiResponse<PollView>>, ApiError> {
     let group_id = poll_in_my_group(&state, id, user.id).await?;
-    let ctx = active_group(&state, user.id).await?;
+    let my_role = role_in_group(&state, group_id, user.id).await?.unwrap_or_default();
     let row: Option<(bool,)> = sqlx::query_as("SELECT attendance_locked FROM polls WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?;
     let (locked,) = row.ok_or(ApiError::NotFound)?;
-    if locked && !ctx.is_admin() {
+    if locked && my_role != "admin" {
         return Err(ApiError::Conflict(
             "Attendance is already confirmed. Ask an admin to unlock it.".into(),
         ));
@@ -419,12 +442,66 @@ pub async fn delete_poll(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    poll_in_my_group(&state, id, user.id).await?;
-    let ctx = active_group(&state, user.id).await?;
-    if !ctx.is_admin() {
+    let group_id = poll_in_my_group(&state, id, user.id).await?;
+    if role_in_group(&state, group_id, user.id).await?.as_deref() != Some("admin") {
         return Err(ApiError::Forbidden);
     }
     sqlx::query("DELETE FROM polls WHERE id = $1").bind(id).execute(&state.db).await?;
     state.broadcast(LiveEvent::PollChanged { poll_id: id });
     Ok(Json(ApiResponse::message("Poll deleted.")))
+}
+
+/// One row per group-with-a-poll-today for the caller — the Home "Tonight"
+/// card and the cross-group polls page.
+#[derive(Serialize)]
+pub struct TonightPoll {
+    pub group_id: Uuid,
+    pub group_name: String,
+    pub id: Uuid,
+    pub proposed_time: String,
+    pub note: Option<String>,
+    pub attendance_locked: bool,
+    pub yes_count: i64,
+    pub maybe_count: i64,
+    pub no_count: i64,
+    pub my_vote: Option<String>,
+}
+
+pub async fn tonight(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<ApiResponse<Vec<TonightPoll>>>, ApiError> {
+    let rows: Vec<(Uuid, String, Uuid, chrono::NaiveTime, Option<String>, bool, i64, i64, i64, Option<String>)> =
+        sqlx::query_as(
+            "SELECT p.group_id, g.name, p.id, p.proposed_time, p.note, p.attendance_locked,
+                    (SELECT COUNT(*) FROM poll_votes v WHERE v.poll_id = p.id AND v.vote = 'yes'),
+                    (SELECT COUNT(*) FROM poll_votes v WHERE v.poll_id = p.id AND v.vote = 'maybe'),
+                    (SELECT COUNT(*) FROM poll_votes v WHERE v.poll_id = p.id AND v.vote = 'no'),
+                    (SELECT v.vote FROM poll_votes v WHERE v.poll_id = p.id AND v.user_id = $1)
+             FROM polls p
+             JOIN groups g ON g.id = p.group_id
+             JOIN group_members gm ON gm.group_id = p.group_id AND gm.user_id = $1
+             WHERE p.game_date = $2
+             ORDER BY g.name",
+        )
+        .bind(user.id)
+        .bind(time::today())
+        .fetch_all(&state.db)
+        .await?;
+    let out = rows
+        .into_iter()
+        .map(|(group_id, group_name, id, t, note, locked, yes, maybe, no, my_vote)| TonightPoll {
+            group_id,
+            group_name,
+            id,
+            proposed_time: t.format("%H:%M").to_string(),
+            note,
+            attendance_locked: locked,
+            yes_count: yes,
+            maybe_count: maybe,
+            no_count: no,
+            my_vote,
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(out)))
 }

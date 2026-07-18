@@ -232,6 +232,11 @@ pub async fn ensure_today_poll(
     match insert {
         Ok((poll_id,)) => {
             state.broadcast(LiveEvent::PollChanged { poll_id });
+            let group_name: String = sqlx::query_scalar("SELECT name FROM groups WHERE id = $1")
+                .bind(group_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|_| "RallyUp".into());
             notify::poll_created(
                 state,
                 group_id,
@@ -239,6 +244,7 @@ pub async fn ensure_today_poll(
                 "RallyUp",
                 &proposed_time.format("%H:%M").to_string(),
                 true,
+                &group_name,
             );
             Ok(true)
         }

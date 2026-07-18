@@ -127,6 +127,9 @@ pub async fn today(
 
 #[derive(Deserialize)]
 pub struct CreateReservationReq {
+    /// Explicit target group (native app resolves via /resolve-group; absent →
+    /// the caller's active group, which keeps the web app unchanged).
+    pub group_id: Option<Uuid>,
     pub court_number: i16,
     /// Single login (manual reservation form). Kept for back-compat.
     pub credential_id: Option<Uuid>,
@@ -150,8 +153,21 @@ pub async fn create(
     user: AuthUser,
     Json(req): Json<CreateReservationReq>,
 ) -> Result<Json<ApiResponse<ReservationView>>, ApiError> {
-    let ctx = active_group(&state, user.id).await?;
-    let (cmin, cmax) = crate::routes::groups::court_range(&state, ctx.group_id).await?;
+    let gid = match req.group_id {
+        Some(g) => {
+            let member: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2",
+            )
+            .bind(g)
+            .bind(user.id)
+            .fetch_optional(&state.db)
+            .await?;
+            member.ok_or(ApiError::Forbidden)?;
+            g
+        }
+        None => active_group(&state, user.id).await?.group_id,
+    };
+    let (cmin, cmax) = crate::routes::groups::court_range(&state, gid).await?;
     if !(cmin..=cmax).contains(&req.court_number) {
         return Err(ApiError::BadRequest(format!(
             "Court number must be between {cmin} and {cmax} at your venue."
@@ -226,7 +242,7 @@ pub async fn create(
         )
         .bind(cid)
         .bind(user.id)
-        .bind(ctx.group_id)
+        .bind(gid)
         .fetch_optional(&state.db)
         .await?;
         let (name, gdate) = cred.ok_or_else(|| ApiError::BadRequest("credential not found".into()))?;
@@ -274,7 +290,7 @@ pub async fn create(
     .bind(req.queue_number)
     .bind(notes)
     .bind(time::today())
-    .bind(ctx.group_id)
+    .bind(gid)
     .fetch_one(&state.db)
     .await;
     let id: (Uuid,) = match inserted {
@@ -313,7 +329,7 @@ pub async fn create(
     } else {
         None
     };
-    notify::reservation_logged(&state, ctx.group_id, user.id, &by_name.0, req.court_number, duration, future_time);
+    notify::reservation_logged(&state, gid, user.id, &by_name.0, req.court_number, duration, future_time);
 
     let view = load_one(&state, id.0).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse::ok(view)))
@@ -1036,4 +1052,76 @@ mod tests {
     fn different_courts_never_conflict() {
         assert!(!slots_conflict(&slot(1, None, false, 0, 45), &slot(2, None, false, 0, 45)));
     }
+}
+
+/// Which group should a new court belong to, given the logins being attached?
+/// Common group of the logins → single candidate (auto). Players sharing more
+/// than one group → several candidates, and the app asks the user (only then).
+#[derive(Deserialize)]
+pub struct ResolveGroupReq {
+    #[serde(default)]
+    pub credential_ids: Vec<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct GroupCandidate {
+    pub id: Uuid,
+    pub name: String,
+}
+
+pub async fn resolve_group(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<ResolveGroupReq>,
+) -> Result<Json<ApiResponse<Vec<GroupCandidate>>>, ApiError> {
+    use std::collections::HashSet;
+    let mine: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT g.id, g.name FROM groups g JOIN group_members gm ON gm.group_id = g.id
+         WHERE gm.user_id = $1 ORDER BY g.name",
+    )
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await?;
+    let my_ids: HashSet<Uuid> = mine.iter().map(|(id, _)| *id).collect();
+
+    let mut ids: Vec<Uuid> = req.credential_ids.clone();
+    ids.dedup();
+    let mut inter: Option<HashSet<Uuid>> = None;
+    let mut union: HashSet<Uuid> = HashSet::new();
+    for cid in &ids {
+        let gs: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT group_id FROM credential_shares WHERE credential_id = $1",
+        )
+        .bind(cid)
+        .fetch_all(&state.db)
+        .await?;
+        let set: HashSet<Uuid> = gs.into_iter().map(|(g,)| g).collect();
+        union.extend(set.iter().copied());
+        inter = Some(match inter {
+            None => set,
+            Some(prev) => prev.intersection(&set).copied().collect(),
+        });
+    }
+
+    let candidates: HashSet<Uuid> = match inter {
+        // No logins attached → any of my groups could host the court.
+        None => my_ids.clone(),
+        Some(common) => {
+            let common_mine: HashSet<Uuid> = common.intersection(&my_ids).copied().collect();
+            if !common_mine.is_empty() {
+                common_mine
+            } else {
+                // Disjoint logins — fall back to any shared group I belong to.
+                let u: HashSet<Uuid> = union.intersection(&my_ids).copied().collect();
+                if u.is_empty() { my_ids.clone() } else { u }
+            }
+        }
+    };
+
+    let out: Vec<GroupCandidate> = mine
+        .into_iter()
+        .filter(|(id, _)| candidates.contains(id))
+        .map(|(id, name)| GroupCandidate { id, name })
+        .collect();
+    Ok(Json(ApiResponse::ok(out)))
 }
