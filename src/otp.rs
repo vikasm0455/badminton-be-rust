@@ -169,12 +169,33 @@ pub async fn store_code(
     Ok((code, 0))
 }
 
+/// App Store / Play review bypass: reviewers can't read the demo account's
+/// inbox, so ONE env-designated email may sign in with a static code.
+/// Disabled unless BOTH env vars are set; applies to that single email only;
+/// every other account keeps the normal emailed-OTP flow.
+fn review_bypass(email: &str, submitted: &str) -> bool {
+    match (
+        std::env::var("REVIEW_LOGIN_EMAIL"),
+        std::env::var("REVIEW_LOGIN_CODE"),
+    ) {
+        (Ok(review_email), Ok(review_code)) => {
+            !review_code.is_empty()
+                && email.eq_ignore_ascii_case(review_email.trim())
+                && submitted == review_code.trim()
+        }
+        _ => false,
+    }
+}
+
 pub async fn verify_code(
     state: &AppState,
     purpose: OtpPurpose,
     email: &str,
     submitted: &str,
 ) -> Result<VerifyResult, ApiError> {
+    if review_bypass(email, submitted) {
+        return Ok(VerifyResult::Ok);
+    }
     let mut r = redis(state)?;
     let key = format!("otp:{}:{email}", purpose.tag());
     let attempts_key = format!("otp:{}:{email}:attempts", purpose.tag());
