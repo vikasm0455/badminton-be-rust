@@ -178,10 +178,12 @@ fn review_bypass(email: &str, submitted: &str) -> bool {
         std::env::var("REVIEW_LOGIN_EMAIL"),
         std::env::var("REVIEW_LOGIN_CODE"),
     ) {
-        (Ok(review_email), Ok(review_code)) => {
+        (Ok(review_emails), Ok(review_code)) => {
             !review_code.is_empty()
-                && email.eq_ignore_ascii_case(review_email.trim())
                 && submitted == review_code.trim()
+                && review_emails
+                    .split(',')
+                    .any(|allowed| email.eq_ignore_ascii_case(allowed.trim()))
         }
         _ => false,
     }

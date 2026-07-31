@@ -103,3 +103,12 @@ pub async fn send_reactivated(state: &AppState, to: &str, name: &str) -> Result<
     )
     .await
 }
+
+/// Guideline 1.2: content reports and user blocks must notify the developer.
+/// Best-effort — moderation rows are stored regardless of email delivery.
+pub async fn send_moderation_alert(state: &AppState, subject: &str, text: &str) {
+    let to = state.config.moderation_notify_email.clone();
+    if let Err(e) = send_email(state, &to, subject, text).await {
+        tracing::error!(error = %e, "moderation alert email failed (report/block still stored)");
+    }
+}

@@ -88,10 +88,16 @@ pub async fn today(
          JOIN users u ON u.id = r.reserved_by
          LEFT JOIN users cu ON cu.id = r.completed_by
          WHERE r.game_date = $1 AND r.group_id = $2
+           AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                           WHERE ub.blocker_id = $3 AND ub.blocked_id = r.reserved_by)
+           AND NOT EXISTS (SELECT 1 FROM content_reports cr
+                           WHERE cr.reporter_id = $3 AND cr.content_type = 'reservation'
+                             AND cr.content_id = r.id)
          ORDER BY (r.status = 'active') DESC, r.expiry_at ASC",
     )
     .bind(time::today())
     .bind(ctx.group_id)
+    .bind(user.id)
     .fetch_all(&state.db)
     .await?;
 

@@ -74,9 +74,12 @@ async fn load_poll_view(
         "SELECT v.user_id, u.display_name, v.vote
          FROM poll_votes v JOIN users u ON u.id = v.user_id
          WHERE v.poll_id = $1
+           AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                           WHERE ub.blocker_id = $2 AND ub.blocked_id = v.user_id)
          ORDER BY v.voted_at ASC",
     )
     .bind(poll_id)
+    .bind(viewer)
     .fetch_all(&state.db)
     .await?
     .into_iter()
@@ -90,9 +93,14 @@ async fn load_poll_view(
 
     let attendees: Vec<PublicUser> = sqlx::query_as(
         "SELECT u.id, u.display_name FROM attendance a
-         JOIN users u ON u.id = a.user_id WHERE a.poll_id = $1 ORDER BY u.display_name",
+         JOIN users u ON u.id = a.user_id
+         WHERE a.poll_id = $1
+           AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                           WHERE ub.blocker_id = $2 AND ub.blocked_id = a.user_id)
+         ORDER BY u.display_name",
     )
     .bind(poll_id)
+    .bind(viewer)
     .fetch_all(&state.db)
     .await?;
 
@@ -121,9 +129,16 @@ pub async fn today(
 ) -> Result<Json<ApiResponse<Option<PollView>>>, ApiError> {
     let ctx = active_group(&state, user.id).await?;
     let id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM polls WHERE game_date = $1 AND group_id = $2")
+        sqlx::query_as(
+            "SELECT id FROM polls p WHERE p.game_date = $1 AND p.group_id = $2
+               AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                               WHERE ub.blocker_id = $3 AND ub.blocked_id = p.created_by)
+               AND NOT EXISTS (SELECT 1 FROM content_reports cr
+                               WHERE cr.reporter_id = $3 AND cr.content_type = 'poll'
+                                 AND cr.content_id = p.id)")
             .bind(time::today())
             .bind(ctx.group_id)
+            .bind(user.id)
             .fetch_optional(&state.db)
             .await?;
     let view = match id {
@@ -482,6 +497,11 @@ pub async fn tonight(
              JOIN groups g ON g.id = p.group_id
              JOIN group_members gm ON gm.group_id = p.group_id AND gm.user_id = $1
              WHERE p.game_date = $2
+               AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                               WHERE ub.blocker_id = $1 AND ub.blocked_id = p.created_by)
+               AND NOT EXISTS (SELECT 1 FROM content_reports cr
+                               WHERE cr.reporter_id = $1 AND cr.content_type = 'poll'
+                                 AND cr.content_id = p.id)
              ORDER BY g.name",
         )
         .bind(user.id)

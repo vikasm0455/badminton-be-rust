@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod groups;
 pub mod health;
 pub mod kcal;
+pub mod moderation;
 pub mod polls;
 pub mod push;
 pub mod reservations;

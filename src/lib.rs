@@ -109,6 +109,10 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/kcal/today", get(routes::kcal::today))
         .route("/api/kcal/history", get(routes::kcal::history))
         .route("/api/kcal", post(routes::kcal::log))
+        .route("/api/moderation/report", post(routes::moderation::report))
+        .route("/api/moderation/block", post(routes::moderation::block))
+        .route("/api/moderation/block/:id", axum::routing::delete(routes::moderation::unblock))
+        .route("/api/moderation/blocked", get(routes::moderation::blocked_list))
         // ---- push ----------------------------------------------------------
         .route("/api/push/vapid-public-key", get(routes::push::vapid_public_key))
         .route(
@@ -190,6 +194,9 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         ("POST", "/api/invites/:id/accept") => "invite_accepted",
         ("PUT", "/api/groups/venue") => "venue_updated",
         ("POST", "/api/kcal") => "kcal_logged",
+        ("POST", "/api/moderation/report") => "content_reported",
+        ("POST", "/api/moderation/block") => "user_blocked",
+        ("DELETE", "/api/moderation/block/:id") => "user_unblocked",
         ("POST", "/api/push/device") => "device_registered",
         _ => return None,
     })

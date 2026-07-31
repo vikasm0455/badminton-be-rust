@@ -15,6 +15,8 @@ pub struct Config {
     pub anthropic_api_key: Option<String>,
     /// Claude model used for screenshot OCR.
     pub anthropic_model: String,
+    /// Where moderation reports/blocks are emailed (Guideline 1.2 notify).
+    pub moderation_notify_email: String,
     /// The owner's email — always treated as admin (PRD §3, single admin v1).
     pub admin_email: Option<String>,
     /// VAPID contact subject, e.g. "mailto:admin@boyishesh.com".
@@ -66,6 +68,10 @@ impl Config {
             .unwrap_or_else(|| "RallyUp <onboarding@resend.dev>".to_string());
 
         let anthropic_api_key = env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
+        let moderation_notify_email = env::var("MODERATION_NOTIFY_EMAIL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "support@badmintonrallyup.com".to_string());
         let anthropic_model = env::var("ANTHROPIC_MODEL")
             .ok()
             .filter(|m| !m.is_empty())
@@ -122,6 +128,7 @@ impl Config {
             resend_api_key,
             email_from,
             anthropic_api_key,
+            moderation_notify_email,
             anthropic_model,
             admin_email,
             vapid_subject,

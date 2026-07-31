@@ -86,6 +86,11 @@ pub async fn today(
                                  AND ($3::uuid IS NULL OR s.group_id = $3)
                                  AND EXISTS (SELECT 1 FROM group_members gm
                                              WHERE gm.group_id = s.group_id AND gm.user_id = $2)))
+               AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                               WHERE ub.blocker_id = $2 AND ub.blocked_id = c.posted_by)
+               AND NOT EXISTS (SELECT 1 FROM content_reports cr
+                               WHERE cr.reporter_id = $2 AND cr.content_type = 'credential'
+                                 AND cr.content_id = c.id)
              ORDER BY c.posted_at ASC",
         )
         .bind(game_date)
