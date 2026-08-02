@@ -26,6 +26,7 @@ pub mod event {
     pub const MEMBER_DEACTIVATED: &str = "member_deactivated";
     pub const MEMBER_REACTIVATED: &str = "member_reactivated";
     pub const CREDENTIAL_POSTED: &str = "credential_posted";
+    pub const CREDENTIAL_UPDATED: &str = "credential_updated";
     pub const CREDENTIAL_DELETED: &str = "credential_deleted";
     pub const INVALID_INVITE_ATTEMPT: &str = "invalid_invite_attempt";
     pub const ADMIN_ACTION: &str = "admin_action";

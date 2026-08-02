@@ -79,6 +79,12 @@ R=$(BB -X POST $B/api/credentials -H 'Content-Type: application/json' -d '{"bint
 CRED=$(echo "$R" | jqf "d['data']['id']")
 R=$(A $B/api/credentials/today)
 check "A sees B's login in Alpha"   'lion16' "$R"
+R=$(A -X PUT $B/api/credentials/$CRED -H 'Content-Type: application/json' -d '{"bintang_name":"Hax","bintang_password":"nope"}')
+check "non-owner cannot edit login → 403" 'forbidden' "$R"
+R=$(BB -X PUT $B/api/credentials/$CRED -H 'Content-Type: application/json' -d '{"bintang_name":"Suchi","bintang_password":"tiger99"}')
+check "owner edits own login"       'Login updated' "$R"
+R=$(A $B/api/credentials/today)
+check "edit visible to group"       'tiger99' "$R"
 
 signup Cara cara@test.io /tmp/ck_c.txt >/dev/null
 C -X POST $B/api/groups -H 'Content-Type: application/json' -d '{"name":"Beta"}' >/dev/null

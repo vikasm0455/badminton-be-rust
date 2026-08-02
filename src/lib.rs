@@ -92,7 +92,10 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/credentials", post(routes::credentials::post_credential))
         .route("/api/credentials/ocr", post(routes::credentials::ocr_credential))
         .route("/api/credentials/clear-today", post(routes::credentials::clear_today))
-        .route("/api/credentials/:id", delete(routes::credentials::delete_credential))
+        .route(
+            "/api/credentials/:id",
+            put(routes::credentials::update_credential).delete(routes::credentials::delete_credential),
+        )
         .route("/api/credentials/:id/shares", put(routes::credentials::set_shares))
         .route("/api/credentials/:id/screenshot", get(routes::credentials::screenshot))
         // ---- reservations --------------------------------------------------
@@ -186,6 +189,10 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         ("PUT", "/api/reservations/:id/complete") => "court_completed",
         ("POST", "/api/reservations/scan-board") => "board_scanned",
         ("POST", "/api/credentials") => "login_posted",
+        ("PUT", "/api/credentials/:id") => "login_edited",
+        // "removed", not "deleted": the same route serves owner hard-deletes
+        // AND group-admin unshares — the label must cover both.
+        ("DELETE", "/api/credentials/:id") => "login_removed",
         ("POST", "/api/credentials/ocr") => "login_ocr",
         ("PUT", "/api/credentials/:id/shares") => "shares_updated",
         ("POST", "/api/groups") => "group_created",

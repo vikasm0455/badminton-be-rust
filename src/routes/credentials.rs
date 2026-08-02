@@ -207,7 +207,12 @@ pub async fn post_credential(
     let ctx = active_group(&state, user.id).await?;
     let name = req.bintang_name.trim();
     let pass = req.bintang_password.trim();
-    if name.is_empty() || name.len() > 50 || pass.is_empty() || pass.len() > 50 {
+    // chars(), not len(): the clients validate 50 characters, not 50 bytes.
+    if name.is_empty()
+        || name.chars().count() > 50
+        || pass.is_empty()
+        || pass.chars().count() > 50
+    {
         return Err(ApiError::BadRequest("name and password are required (max 50 chars)".into()));
     }
     // Only accept a screenshot path we actually created for today.
@@ -347,6 +352,53 @@ pub async fn screenshot(
 #[derive(Deserialize)]
 pub struct SetSharesReq {
     pub group_ids: Vec<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateCredentialReq {
+    pub bintang_name: String,
+    pub bintang_password: String,
+}
+
+/// Owner-only: fix a typo in a posted login (name/password). Sharing stays
+/// as picked — that's PUT :id/shares.
+pub async fn update_credential(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateCredentialReq>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let name = req.bintang_name.trim();
+    let pass = req.bintang_password.trim();
+    // chars(), not len(): the clients validate 50 characters, not 50 bytes.
+    if name.is_empty()
+        || name.chars().count() > 50
+        || pass.is_empty()
+        || pass.chars().count() > 50
+    {
+        return Err(ApiError::BadRequest("name and password are required (max 50 chars)".into()));
+    }
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT posted_by FROM court_credentials WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    match owner {
+        None => return Err(ApiError::NotFound),
+        Some((posted_by,)) if posted_by != user.id => return Err(ApiError::Forbidden),
+        Some(_) => {}
+    }
+    sqlx::query(
+        "UPDATE court_credentials SET bintang_name = $1, bintang_password = $2 WHERE id = $3",
+    )
+    .bind(name)
+    .bind(pass)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    security::log(&state, event::CREDENTIAL_UPDATED, Some(user.id), None, serde_json::json!({ "id": id })).await;
+    state.broadcast(LiveEvent::CredentialsChanged);
+    Ok(Json(ApiResponse::message("Login updated.")))
 }
 
 /// Owner-only: re-point which groups can see this login.
