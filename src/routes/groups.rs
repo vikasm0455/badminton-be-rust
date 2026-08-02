@@ -433,11 +433,18 @@ pub struct SendInviteReq {
     pub email: String,
 }
 
+#[derive(Serialize)]
+pub struct SendInviteResult {
+    pub invites: Vec<GroupInviteRow>,
+    /// "sent" | "failed" | "skipped" (no email provider configured).
+    pub email_delivery: &'static str,
+}
+
 pub async fn send_invite(
     State(state): State<AppState>,
     user: AuthUser,
     Json(req): Json<SendInviteReq>,
-) -> Result<Json<ApiResponse<Vec<GroupInviteRow>>>, ApiError> {
+) -> Result<Json<ApiResponse<SendInviteResult>>, ApiError> {
     let ctx = require_group_admin(&state, user.id).await?;
     let invite_email = req.email.trim().to_lowercase();
     if !invite_email.contains('@') || invite_email.len() < 5 || invite_email.len() > 254 {
@@ -505,9 +512,36 @@ pub async fn send_invite(
     if let Some((invitee_id,)) = invitee {
         crate::notify::group_invited(&state, invitee_id, &group_name, &inviter);
     }
-    email::send_group_invite(&state, &invite_email, &group_name, &inviter).await.ok();
+    // The invite row exists either way; email_delivery is the machine-readable
+    // outcome (clients pick green/amber from it, never from the message text)
+    // so the app never claims "sent" when nothing went out — including when
+    // RESEND_API_KEY isn't configured and the send was only logged.
+    let email_ok = email::send_group_invite(&state, &invite_email, &group_name, &inviter)
+        .await
+        .is_ok();
+    let email_delivery = if state.config.resend_api_key.is_none() {
+        "skipped"
+    } else if email_ok {
+        "sent"
+    } else {
+        "failed"
+    };
+    let message = match email_delivery {
+        "sent" => format!("Invite sent to {invite_email}"),
+        "failed" => {
+            "Invite saved, but the email couldn't be sent — they'll still see it in RallyUp \
+             when they sign up with this address."
+                .to_string()
+        }
+        _ => {
+            "Invite saved — email sending isn't set up on this server, so let them know to \
+             sign up with this address."
+                .to_string()
+        }
+    };
 
-    list_group_invites_inner(&state, ctx.group_id).await.map(|rows| Json(ApiResponse::ok(rows)))
+    let invites = list_group_invites_inner(&state, ctx.group_id).await?;
+    Ok(Json(ApiResponse::ok_msg(SendInviteResult { invites, email_delivery }, message)))
 }
 
 pub async fn list_group_invites(

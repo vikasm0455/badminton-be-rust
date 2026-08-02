@@ -41,6 +41,7 @@ PSQL -d postgres -c "DROP DATABASE IF EXISTS rallyup_groups_e2e" >/dev/null
 DATABASE_URL="postgres://postgres:%40Anu_%40Vikki_0455@127.0.0.1:5432/rallyup_groups_e2e" \
 REDIS_URL="redis://127.0.0.1:6379" JWT_SECRET="dev-smoke-secret-at-least-32-characters-longxx" \
 UPLOADS_PATH="./uploads_e2e" PORT=8089 RUST_LOG=warn \
+RESEND_API_KEY="" \
 target/debug/rallyup-api > /tmp/groups_e2e.log 2>&1 &
 API=$!
 sleep 6
@@ -63,7 +64,10 @@ R=$(signup Alice alice@test.io /tmp/ck_a.txt)
 check "A signup (cookie web flow)"  '"status":"active"' "$R"
 R=$(A -X POST $B/api/groups -H 'Content-Type: application/json' -d '{"name":"Alpha"}')
 check "A creates Alpha"             '"role":"admin"' "$R"
-A -X POST $B/api/groups/invites -H 'Content-Type: application/json' -d '{"email":"bob@test.io"}' >/dev/null
+R=$(A -X POST $B/api/groups/invites -H 'Content-Type: application/json' -d '{"email":"bob@test.io"}')
+check "invite reports email_delivery (no key → skipped)" '"email_delivery":"skipped"' "$R"
+check "invite honest message when not sent" 'Invite saved' "$R"
+check "invite returns invite list"  '"email":"bob@test.io"' "$R"
 signup Bob bob@test.io /tmp/ck_b.txt >/dev/null
 INV=$(BB $B/api/invites | jqf "d['data'][0]['id']")
 R=$(BB -X POST $B/api/invites/$INV/accept)

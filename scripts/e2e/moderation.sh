@@ -20,6 +20,7 @@ cargo build --bin rallyup-api 2>/dev/null >/dev/null
 DATABASE_URL="postgres://postgres:%40Anu_%40Vikki_0455@127.0.0.1:5432/rallyup_mod_e2e" \
 REDIS_URL="redis://127.0.0.1:6379" JWT_SECRET="dev-smoke-secret-at-least-32-characters-longxx" \
 UPLOADS_PATH="./uploads_mod_e2e" PORT=8094 RUST_LOG=warn \
+RESEND_API_KEY="" \
 target/debug/rallyup-api > /tmp/mod_e2e.log 2>&1 &
 API_PID=$!
 sleep 6

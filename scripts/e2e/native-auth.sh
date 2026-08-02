@@ -21,6 +21,7 @@ DATABASE_URL="postgres://postgres:%40Anu_%40Vikki_0455@127.0.0.1:5432/rallyup_na
 REDIS_URL="redis://127.0.0.1:6379" JWT_SECRET="dev-smoke-secret-at-least-32-characters-longxx" \
 UPLOADS_PATH="./uploads_native_e2e" PORT=8091 RUST_LOG=warn \
 REFRESH_REUSE_GRACE_SECS=2 \
+RESEND_API_KEY="" \
 target/debug/rallyup-api > /tmp/native_e2e.log 2>&1 &
 API=$!
 sleep 6
