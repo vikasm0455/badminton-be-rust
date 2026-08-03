@@ -90,12 +90,35 @@ async fn sliding_window(
     (true, 0)
 }
 
+/// True when this email is one of the env-designated store-review accounts
+/// (REVIEW_LOGIN_EMAIL comma-list) and a static REVIEW_LOGIN_CODE is set.
+pub fn is_review_email(email: &str) -> bool {
+    match (
+        std::env::var("REVIEW_LOGIN_EMAIL"),
+        std::env::var("REVIEW_LOGIN_CODE"),
+    ) {
+        (Ok(review_emails), Ok(review_code)) => {
+            !review_code.is_empty()
+                && review_emails
+                    .split(',')
+                    .any(|allowed| email.eq_ignore_ascii_case(allowed.trim()))
+        }
+        _ => false,
+    }
+}
+
 /// Enforce per-email and per-IP OTP request limits before issuing a code.
 pub async fn check_request_limits(
     state: &AppState,
     email: &str,
     ip: IpAddr,
 ) -> Result<(), ApiError> {
+    // Store-review accounts are exempt: a reviewer retrying sign-in must never
+    // see "Too many requests" (their code is static, so the limiter defends
+    // nothing here — brute-force on the verify side keeps its own counters).
+    if is_review_email(email) {
+        return Ok(());
+    }
     let (ok, retry) = sliding_window(
         state,
         &format!("otp_req:{email}"),
@@ -169,21 +192,16 @@ pub async fn store_code(
     Ok((code, 0))
 }
 
-/// App Store / Play review bypass: reviewers can't read the demo account's
-/// inbox, so ONE env-designated email may sign in with a static code.
-/// Disabled unless BOTH env vars are set; applies to that single email only;
-/// every other account keeps the normal emailed-OTP flow.
+/// App Store / Play review bypass: reviewers can't read the demo accounts'
+/// inboxes, so the env-designated emails (comma-list) may sign in with a
+/// static code. Disabled unless BOTH env vars are set; applies to those
+/// emails only; every other account keeps the normal emailed-OTP flow.
 fn review_bypass(email: &str, submitted: &str) -> bool {
-    match (
-        std::env::var("REVIEW_LOGIN_EMAIL"),
-        std::env::var("REVIEW_LOGIN_CODE"),
-    ) {
-        (Ok(review_emails), Ok(review_code)) => {
+    match std::env::var("REVIEW_LOGIN_CODE") {
+        Ok(review_code) => {
             !review_code.is_empty()
                 && submitted == review_code.trim()
-                && review_emails
-                    .split(',')
-                    .any(|allowed| email.eq_ignore_ascii_case(allowed.trim()))
+                && is_review_email(email)
         }
         _ => false,
     }
