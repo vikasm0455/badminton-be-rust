@@ -273,14 +273,19 @@ pub async fn vote(
         return Err(ApiError::BadRequest("vote must be yes, no, or maybe".into()));
     }
     let group_id = poll_in_my_group(&state, id, user.id).await?;
-    let locked: Option<(bool,)> =
-        sqlx::query_as("SELECT attendance_locked FROM polls WHERE id = $1")
+    let row: Option<(bool, NaiveDate)> =
+        sqlx::query_as("SELECT attendance_locked, game_date FROM polls WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
-    let (locked,) = locked.ok_or(ApiError::NotFound)?;
+    let (locked, game_date) = row.ok_or(ApiError::NotFound)?;
     if locked {
         return Err(ApiError::Conflict("Voting is closed — attendance is confirmed.".into()));
+    }
+    // A share page (or history view) left open past midnight must not keep
+    // mutating yesterday's poll. Future-dated polls stay votable.
+    if game_date < time::today() {
+        return Err(ApiError::Conflict("This poll has ended.".into()));
     }
 
     sqlx::query(
@@ -524,4 +529,121 @@ pub async fn tonight(
         })
         .collect();
     Ok(Json(ApiResponse::ok(out)))
+}
+
+// ---- shareable poll links ---------------------------------------------------------
+//
+// A member mints one unguessable URL per poll to post in the group chat; the
+// public page shows live info (for chat-app previews) and members vote there.
+// No stored expiry: the link is only served while the poll is today's.
+
+#[derive(Serialize)]
+pub struct PollShareLink {
+    pub url: String,
+}
+
+fn poll_share_url(state: &AppState, token: &str) -> String {
+    let base = state
+        .config
+        .app_base_url
+        .as_deref()
+        .unwrap_or("https://badmintonrallyup.com");
+    format!("{}/p/{token}", base.trim_end_matches('/'))
+}
+
+/// Any member of the poll's group can share — today's polls only.
+pub async fn create_share_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<PollShareLink>>, ApiError> {
+    poll_in_my_group(&state, id, user.id).await?;
+    let (game_date, existing): (NaiveDate, Option<String>) =
+        sqlx::query_as("SELECT game_date, share_token FROM polls WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+    if game_date != time::today() {
+        return Err(ApiError::BadRequest("Only today's polls can be shared.".into()));
+    }
+    let token = match existing {
+        Some(t) => t,
+        None => {
+            // First sharer mints it; a concurrent sharer loses the WHERE and
+            // both read back the winner's token.
+            let fresh = Uuid::new_v4().simple().to_string();
+            sqlx::query("UPDATE polls SET share_token = $1 WHERE id = $2 AND share_token IS NULL")
+                .bind(&fresh)
+                .bind(id)
+                .execute(&state.db)
+                .await?;
+            sqlx::query_scalar::<_, Option<String>>("SELECT share_token FROM polls WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?
+                .flatten()
+                .ok_or(ApiError::NotFound)?
+        }
+    };
+    Ok(Json(ApiResponse::ok(PollShareLink { url: poll_share_url(&state, &token) })))
+}
+
+#[derive(Serialize)]
+pub struct PollShareView {
+    pub poll_id: Uuid,
+    pub group_name: String,
+    pub proposed_time: String,
+    pub note: Option<String>,
+    pub locked: bool,
+    pub yes: i64,
+    pub maybe: i64,
+    pub no: i64,
+}
+
+#[derive(Serialize)]
+pub struct PollShareInfo {
+    pub ended: bool,
+    pub poll: Option<PollShareView>,
+}
+
+/// PUBLIC (no auth): live info for the share page + chat-app link previews.
+/// Yesterday's tokens say only "ended" (no group data); unknown tokens 404.
+pub async fn share_info(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<ApiResponse<PollShareInfo>>, ApiError> {
+    let row: Option<(Uuid, NaiveDate, NaiveTime, Option<String>, String, bool)> = sqlx::query_as(
+        "SELECT p.id, p.game_date, p.proposed_time, p.note, g.name, p.attendance_locked
+         FROM polls p JOIN groups g ON g.id = p.group_id
+         WHERE p.share_token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?;
+    let (poll_id, game_date, proposed_time, note, group_name, locked) =
+        row.ok_or(ApiError::NotFound)?;
+    if game_date != time::today() {
+        return Ok(Json(ApiResponse::ok(PollShareInfo { ended: true, poll: None })));
+    }
+    let counts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT vote, COUNT(*) FROM poll_votes WHERE poll_id = $1 GROUP BY vote")
+            .bind(poll_id)
+            .fetch_all(&state.db)
+            .await?;
+    let count = |k: &str| counts.iter().find(|(v, _)| v == k).map_or(0, |(_, c)| *c);
+    Ok(Json(ApiResponse::ok(PollShareInfo {
+        ended: false,
+        poll: Some(PollShareView {
+            poll_id,
+            group_name,
+            // 12-hour like the rest of the product ("7:00 PM", not "19:00").
+            proposed_time: proposed_time.format("%-I:%M %p").to_string(),
+            note,
+            locked,
+            yes: count("yes"),
+            maybe: count("maybe"),
+            no: count("no"),
+        }),
+    })))
 }

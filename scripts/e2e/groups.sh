@@ -90,9 +90,35 @@ signup Cara cara@test.io /tmp/ck_c.txt >/dev/null
 C -X POST $B/api/groups -H 'Content-Type: application/json' -d '{"name":"Beta"}' >/dev/null
 R=$(C $B/api/credentials/today)
 check "C (Beta) sees NO Alpha logins [ISOLATION]" '"data":[]' "$R"
-A -X POST $B/api/polls -H 'Content-Type: application/json' -d '{"proposed_time":"18:00"}' >/dev/null
+APOLL=$(A -X POST $B/api/polls -H 'Content-Type: application/json' -d '{"proposed_time":"18:00"}' | jqf "d['data']['id']")
 R=$(C $B/api/polls/today)
 check "C sees no Alpha poll [ISOLATION]" '"data":null' "$R"
+
+# ---- shareable poll links
+R=$(C -X POST $B/api/polls/$APOLL/share-link)
+check "non-member cannot share poll" 'not found' "$R"
+R=$(A -X POST $B/api/polls/$APOLL/share-link)
+check "member shares poll"          '/p/' "$R"
+PSHARE=$(echo "$R" | jqf "d['data']['url'].split('/p/')[1]")
+BB -X PUT $B/api/polls/$APOLL/vote -H 'Content-Type: application/json' -d '{"vote":"yes"}' >/dev/null
+R=$(curl -s $B/api/poll-share/$PSHARE)
+check "poll share info is public"   '"group_name":"Alpha"' "$R"
+check "poll share shows live count" '"yes":1' "$R"
+R=$(curl -s -o /dev/null -w '%{http_code}' $B/api/poll-share/deadbeefdeadbeefdeadbeefdeadbeef)
+check "unknown share token 404s"    '404' "$R"
+R=$(BB -X POST $B/api/polls/$APOLL/share-link)
+check "second sharer gets same URL" "$PSHARE" "$R"
+R=$(curl -s $B/api/poll-share/$PSHARE)
+check "share time is 12-hour"       '"proposed_time":"6:00 PM"' "$R"
+# Age the poll to yesterday: token must go dark, sharing/voting must stop.
+PSQL -d rallyup_groups_e2e -c "UPDATE polls SET game_date = game_date - 1 WHERE id = '$APOLL'" >/dev/null
+R=$(curl -s $B/api/poll-share/$PSHARE)
+check "ended link says only ended"  '"ended":true,"poll":null' "$R"
+R=$(A -X POST $B/api/polls/$APOLL/share-link)
+check "cannot share a past poll"    "Only today's polls" "$R"
+R=$(BB -X PUT $B/api/polls/$APOLL/vote -H 'Content-Type: application/json' -d '{"vote":"no"}')
+check "cannot vote on a past poll"  'This poll has ended' "$R"
+PSQL -d rallyup_groups_e2e -c "UPDATE polls SET game_date = game_date + 1 WHERE id = '$APOLL'" >/dev/null
 R=$(C -X POST $B/api/polls -H 'Content-Type: application/json' -d '{"proposed_time":"19:00"}')
 check "C creates Beta poll same date" '"proposed_time":"19:00"' "$R"
 
