@@ -124,6 +124,38 @@ check "group admin cancels"         'cancelled' "$R"
 R=$(A $B/api/members)
 check "Alpha roster = 2"            '2' "$(echo $R | jqf "len(d['data'])")"
 
+# ---- shareable invite links
+R=$(A -X POST $B/api/groups/invite-link)
+check "admin creates invite link"   '/join/' "$R"
+LINKTOK=$(echo "$R" | jqf "d['data']['url'].split('/join/')[1]")
+R=$(BB -X POST $B/api/groups/invite-link)
+check "member cannot create link → 403" 'forbidden' "$R"
+R=$(curl -s $B/api/join/$LINKTOK)
+check "join info is public"         '"group_name":"Alpha"' "$R"
+signup Dora dora@test.io /tmp/ck_d.txt >/dev/null
+DD() { curl -s -b /tmp/ck_d.txt "$@"; }
+R=$(DD -X POST $B/api/join/$LINKTOK)
+check "Dora joins via link"         'Welcome to Alpha' "$R"
+check "join reports newly_joined"   '"newly_joined":true' "$R"
+R=$(DD -X POST $B/api/join/$LINKTOK)
+check "re-join is idempotent"       'already a member' "$R"
+DORA=$(DD $B/api/auth/me | jqf "d['data']['id']")
+A -X POST $B/api/moderation/block -H 'Content-Type: application/json' -d "{\"user_id\":\"$DORA\"}" >/dev/null
+R=$(DD -X POST $B/api/join/$LINKTOK)
+check "admin-blocked user can't use link" 'no longer valid' "$R"
+A -X DELETE $B/api/moderation/block/$DORA >/dev/null
+R=$(A $B/api/groups/invite-link)
+check "join_count incremented"      '"join_count":1' "$R"
+R=$(A -X POST $B/api/groups/invite-link)
+NEWTOK=$(echo "$R" | jqf "d['data']['url'].split('/join/')[1]")
+R=$(C -X POST $B/api/join/$LINKTOK)
+check "rotated link kills old token" 'no longer valid' "$R"
+A -X DELETE $B/api/groups/invite-link >/dev/null
+R=$(C -X POST $B/api/join/$NEWTOK)
+check "disabled link rejected"      'no longer valid' "$R"
+R=$(curl -s $B/api/join/$NEWTOK)
+check "disabled link info leaks nothing" '"success":false' "$R"
+
 R=$(A -X POST $B/api/groups/leave)
 check "sole admin cannot leave → 409" 'promote another' "$R"
 BOB=$(BB $B/api/auth/me | jqf "d['data']['id']")

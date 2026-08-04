@@ -476,6 +476,12 @@ pub async fn delete_me(
     .bind(uid)
     .execute(&mut *tx)
     .await?;
+    // Same rule for shareable links they minted — the row survives (the user
+    // is anonymized, not deleted, so the FK cascade never fires).
+    sqlx::query("UPDATE group_invite_links SET revoked_at = NOW() WHERE created_by = $1 AND revoked_at IS NULL")
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?;
 
     // Anonymize the user row (frees the email for a future re-signup; history
     // rows keep a coherent author).

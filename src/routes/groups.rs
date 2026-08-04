@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::models::ApiResponse;
+use crate::security::{self, event};
 use crate::state::AppState;
 use crate::email;
 
@@ -701,4 +702,255 @@ pub async fn decline_invite(
     }
     let rows = my_invites_inner(&state, user.id).await?;
     Ok(Json(ApiResponse::ok(rows)))
+}
+
+// ---- invite links: one shareable join URL per group -------------------------------
+//
+// Admin mints a link; anyone opening it can join after signing in. One active
+// link per group (partial unique index); 7-day expiry so a leaked link has a
+// short life; create doubles as rotate (the old link dies instantly).
+
+const INVITE_LINK_TTL_DAYS: i32 = 7;
+
+#[derive(Serialize)]
+pub struct InviteLinkView {
+    pub url: String,
+    pub expires_at: DateTime<Utc>,
+    pub join_count: i32,
+}
+
+fn invite_link_url(state: &AppState, token: &str) -> String {
+    let base = state
+        .config
+        .app_base_url
+        .as_deref()
+        .unwrap_or("https://badmintonrallyup.com");
+    format!("{}/join/{token}", base.trim_end_matches('/'))
+}
+
+/// Wrapper so "no active link" is a decodable value (link: null), never an
+/// empty body — clients can tell it apart from a failed request and won't
+/// offer "Create" (which rotates!) when the truth is unknown.
+#[derive(Serialize)]
+pub struct InviteLinkState {
+    pub link: Option<InviteLinkView>,
+}
+
+pub async fn get_invite_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<ApiResponse<InviteLinkState>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
+    let row: Option<(String, DateTime<Utc>, i32)> = sqlx::query_as(
+        "SELECT token, expires_at, join_count FROM group_invite_links
+         WHERE group_id = $1 AND revoked_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(ctx.group_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(Json(ApiResponse::ok(InviteLinkState {
+        link: row.map(|(token, expires_at, join_count)| InviteLinkView {
+            url: invite_link_url(&state, &token),
+            expires_at,
+            join_count,
+        }),
+    })))
+}
+
+/// Create OR rotate: any existing link (active or expired) is revoked first,
+/// so the unique-active index holds and a leaked link dies on rotation.
+pub async fn create_invite_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<ApiResponse<InviteLinkView>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
+    let token = Uuid::new_v4().simple().to_string();
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE group_invite_links SET revoked_at = NOW() WHERE group_id = $1 AND revoked_at IS NULL")
+        .bind(ctx.group_id)
+        .execute(&mut *tx)
+        .await?;
+    let inserted: Result<(DateTime<Utc>,), sqlx::Error> = sqlx::query_as(
+        "INSERT INTO group_invite_links (group_id, token, created_by, expires_at)
+         VALUES ($1, $2, $3, NOW() + make_interval(days => $4))
+         RETURNING expires_at",
+    )
+    .bind(ctx.group_id)
+    .bind(&token)
+    .bind(user.id)
+    .bind(INVITE_LINK_TTL_DAYS)
+    .fetch_one(&mut *tx)
+    .await;
+    let expires_at = match inserted {
+        Ok((expires_at,)) => expires_at,
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            // Two admins raced create: the other one's fresh link won — hand
+            // that one back instead of a 500 (it IS a brand-new link).
+            drop(tx);
+            let (other, expires_at, join_count): (String, DateTime<Utc>, i32) = sqlx::query_as(
+                "SELECT token, expires_at, join_count FROM group_invite_links
+                 WHERE group_id = $1 AND revoked_at IS NULL AND expires_at > NOW()",
+            )
+            .bind(ctx.group_id)
+            .fetch_one(&state.db)
+            .await?;
+            return Ok(Json(ApiResponse::ok_msg(
+                InviteLinkView { url: invite_link_url(&state, &other), expires_at, join_count },
+                "Invite link created — anyone with it can join after signing in.",
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    tx.commit().await?;
+
+    security::log(&state, event::INVITE_CREATED, Some(user.id), None,
+        serde_json::json!({ "kind": "link", "group_id": ctx.group_id })).await;
+    Ok(Json(ApiResponse::ok_msg(
+        InviteLinkView { url: invite_link_url(&state, &token), expires_at, join_count: 0 },
+        "Invite link created — anyone with it can join after signing in.",
+    )))
+}
+
+pub async fn disable_invite_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let ctx = require_group_admin(&state, user.id).await?;
+    sqlx::query("UPDATE group_invite_links SET revoked_at = NOW() WHERE group_id = $1 AND revoked_at IS NULL")
+        .bind(ctx.group_id)
+        .execute(&state.db)
+        .await?;
+    security::log(&state, event::INVITE_REVOKED, Some(user.id), None,
+        serde_json::json!({ "kind": "link", "group_id": ctx.group_id })).await;
+    Ok(Json(ApiResponse::message("Invite link disabled.")))
+}
+
+#[derive(Serialize)]
+pub struct JoinLinkInfo {
+    pub group_name: String,
+    pub member_count: i64,
+    pub invited_by_name: String,
+}
+
+/// PUBLIC (no auth): what the join page shows before sign-in. Reveals only the
+/// group name / member count / inviter — and only to holders of an ACTIVE
+/// token. Revoked/expired tokens 404 like never-existed ones, so a rotated-out
+/// link can't be used to keep watching the group.
+pub async fn join_link_info(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<ApiResponse<JoinLinkInfo>>, ApiError> {
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT g.name, u.display_name,
+                (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id)
+         FROM group_invite_links gil
+         JOIN groups g ON g.id = gil.group_id
+         JOIN users u ON u.id = gil.created_by
+         WHERE gil.token = $1 AND gil.revoked_at IS NULL AND gil.expires_at > NOW()",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?;
+    let (group_name, invited_by_name, member_count) = row.ok_or(ApiError::NotFound)?;
+    Ok(Json(ApiResponse::ok(JoinLinkInfo { group_name, member_count, invited_by_name })))
+}
+
+#[derive(Serialize)]
+pub struct JoinResult {
+    pub groups: Vec<GroupBrief>,
+    pub newly_joined: bool,
+    pub group_name: String,
+}
+
+/// Signed-in user joins via the link. Idempotent for existing members; the
+/// joined group becomes the active one (the link means "take me there").
+pub async fn join_via_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(token): Path<String>,
+) -> Result<Json<ApiResponse<JoinResult>>, ApiError> {
+    const LINK_DEAD: &str =
+        "This invite link is no longer valid — ask the group admin for a fresh one.";
+
+    let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT gil.id, gil.group_id, g.name
+         FROM group_invite_links gil JOIN groups g ON g.id = gil.group_id
+         WHERE gil.token = $1 AND gil.revoked_at IS NULL AND gil.expires_at > NOW()",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((link_id, group_id, group_name)) = row else {
+        security::log(&state, event::INVALID_INVITE_ATTEMPT, Some(user.id), None,
+            serde_json::json!({ "kind": "link" })).await;
+        return Err(ApiError::BadRequest(LINK_DEAD.into()));
+    };
+
+    // A member an admin blocked can't ride the link back in after removal.
+    // Same message as a dead link — a banned user learns nothing new.
+    let banned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM user_blocks ub
+            JOIN group_members gm ON gm.user_id = ub.blocker_id
+             AND gm.group_id = $1 AND gm.role = 'admin'
+            WHERE ub.blocked_id = $2)",
+    )
+    .bind(group_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
+    if banned {
+        security::log(&state, event::INVALID_INVITE_ATTEMPT, Some(user.id), None,
+            serde_json::json!({ "kind": "link", "reason": "blocked_by_admin", "group_id": group_id })).await;
+        return Err(ApiError::BadRequest(LINK_DEAD.into()));
+    }
+
+    let mut tx = state.db.begin().await?;
+    // Re-validate under a share lock: a concurrent rotate/disable now waits
+    // for us (or we see its effect) instead of a join landing post-revoke —
+    // same guarantee accept_invite's conditional claim gives email invites.
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM group_invite_links
+         WHERE id = $1 AND revoked_at IS NULL AND expires_at > NOW() FOR SHARE",
+    )
+    .bind(link_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        return Err(ApiError::BadRequest(LINK_DEAD.into()));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO group_members (group_id, user_id, role) VALUES ($1, $2, 'member')
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(group_id)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    let newly_joined = inserted.rows_affected() > 0;
+    if newly_joined {
+        sqlx::query("UPDATE group_invite_links SET join_count = join_count + 1 WHERE id = $1")
+            .bind(link_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    // The link means "take me to this group" — make it active either way.
+    sqlx::query("UPDATE users SET active_group_id = $1 WHERE id = $2")
+        .bind(group_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if newly_joined {
+        security::log(&state, event::INVITE_USED, Some(user.id), None,
+            serde_json::json!({ "kind": "link", "group_id": group_id })).await;
+    }
+    let groups = my_groups(&state, user.id).await?;
+    let message = if newly_joined {
+        format!("Welcome to {group_name}!")
+    } else {
+        format!("You're already a member of {group_name}.")
+    };
+    Ok(Json(ApiResponse::ok_msg(JoinResult { groups, newly_joined, group_name }, message)))
 }

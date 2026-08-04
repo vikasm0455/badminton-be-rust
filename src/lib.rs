@@ -75,6 +75,13 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
             get(routes::groups::list_group_invites).post(routes::groups::send_invite),
         )
         .route("/api/groups/invites/:id", delete(routes::groups::revoke_invite))
+        .route(
+            "/api/groups/invite-link",
+            get(routes::groups::get_invite_link)
+                .post(routes::groups::create_invite_link)
+                .delete(routes::groups::disable_invite_link),
+        )
+        .route("/api/join/:token", get(routes::groups::join_link_info).post(routes::groups::join_via_link))
         .route("/api/invites", get(routes::groups::my_invites))
         .route("/api/invites/:id/accept", post(routes::groups::accept_invite))
         .route("/api/invites/:id/decline", post(routes::groups::decline_invite))
@@ -198,6 +205,9 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         ("POST", "/api/groups") => "group_created",
         ("PUT", "/api/groups/active") => "group_switched",
         ("POST", "/api/groups/invites") => "invite_sent",
+        ("POST", "/api/groups/invite-link") => "invite_link_created",
+        ("DELETE", "/api/groups/invite-link") => "invite_link_disabled",
+        ("POST", "/api/join/:token") => "invite_link_joined",
         ("POST", "/api/invites/:id/accept") => "invite_accepted",
         ("PUT", "/api/groups/venue") => "venue_updated",
         ("POST", "/api/kcal") => "kcal_logged",
