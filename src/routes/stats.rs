@@ -5,9 +5,9 @@
 //! or — for polls where attendance was never confirmed — a day they voted yes.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use chrono::{Datelike, Duration, NaiveDate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::auth::AuthUser;
@@ -47,11 +47,30 @@ fn week_start(d: NaiveDate) -> NaiveDate {
     d - Duration::days(d.weekday().num_days_from_monday() as i64)
 }
 
+#[derive(Deserialize)]
+pub struct StatsQuery {
+    /// Chart range in months: 1 (default), 3, or 6. Anything else clamps.
+    pub months: Option<u8>,
+}
+
 pub async fn me(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(query): Query<StatsQuery>,
 ) -> Result<Json<ApiResponse<MyStats>>, ApiError> {
     let today = time::today();
+    let months = match query.months.unwrap_or(1) {
+        m if m >= 6 => 6u8,
+        m if m >= 3 => 3,
+        _ => 1,
+    };
+    // 1M ≈ 5 weeks, 3M ≈ 13, 6M ≈ 26; the kcal window follows the same span.
+    let chart_weeks: i64 = match months {
+        6 => 26,
+        3 => 13,
+        _ => 5,
+    };
+    let kcal_days: i64 = chart_weeks * 7;
 
     // Only days that already happened; the yes-vote fallback never applies to
     // locked polls (locked + zero attendance rows = confirmed nobody played).
@@ -111,8 +130,8 @@ pub async fn me(
         prev = Some(*w);
     }
 
-    let mut weekly_sessions = Vec::with_capacity(8);
-    for i in (0..8i64).rev() {
+    let mut weekly_sessions = Vec::with_capacity(chart_weeks as usize);
+    for i in (0..chart_weeks).rev() {
         let ws = this_week - Duration::days(7 * i);
         let sessions = session_dates
             .iter()
@@ -145,7 +164,7 @@ pub async fn me(
          WHERE user_id = $1 AND game_date > $2 ORDER BY game_date",
     )
     .bind(user.id)
-    .bind(today - Duration::days(30))
+    .bind(today - Duration::days(kcal_days))
     .fetch_all(&state.db)
     .await?;
     let (avg_kcal,): (Option<f64>,) = sqlx::query_as(

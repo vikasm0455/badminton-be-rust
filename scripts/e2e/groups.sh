@@ -202,8 +202,12 @@ check "kcal stays private shape"    '"my_log"' "$R"
 # ---- personal stats (B voted yes on APOLL earlier; attendance never confirmed)
 R=$(BB $B/api/stats/me)
 check "stats: yes-vote day counts as session" '"sessions_total":1' "$R"
-check "stats: 8 weekly buckets"     '8' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
+check "stats: default 1M = 5 weekly buckets" '5' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
 check "stats: yes rate present"     '"yes_rate_percent":' "$R"
+R=$(BB "$B/api/stats/me?months=6")
+check "stats: 6M = 26 weekly buckets" '26' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
+R=$(BB "$B/api/stats/me?months=99")
+check "stats: silly range clamps to 6M" '26' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
 R=$(DD $B/api/stats/me)
 check "stats: no history = zeros"   '"sessions_total":0' "$R"
 
