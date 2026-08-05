@@ -49,8 +49,10 @@ fn week_start(d: NaiveDate) -> NaiveDate {
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
-    /// Chart range in months: 1 (default), 3, or 6. Anything else clamps.
+    /// Preset chart range in months: 1 (default), 3, or 6. Anything else clamps.
     pub months: Option<u8>,
+    /// Custom range in weeks (1..=26); wins over `months` when present.
+    pub weeks: Option<i64>,
 }
 
 pub async fn me(
@@ -59,16 +61,15 @@ pub async fn me(
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<ApiResponse<MyStats>>, ApiError> {
     let today = time::today();
-    let months = match query.months.unwrap_or(1) {
-        m if m >= 6 => 6u8,
-        m if m >= 3 => 3,
-        _ => 1,
-    };
-    // 1M ≈ 5 weeks, 3M ≈ 13, 6M ≈ 26; the kcal window follows the same span.
-    let chart_weeks: i64 = match months {
-        6 => 26,
-        3 => 13,
-        _ => 5,
+    // 1M ≈ 5 weeks, 3M ≈ 13, 6M ≈ 26; a custom `weeks` (clamped to the same
+    // 6-month cap) wins. The kcal window follows the same span.
+    let chart_weeks: i64 = match query.weeks {
+        Some(w) => w.clamp(1, 26),
+        None => match query.months.unwrap_or(1) {
+            m if m >= 6 => 26,
+            m if m >= 3 => 13,
+            _ => 5,
+        },
     };
     let kcal_days: i64 = chart_weeks * 7;
 

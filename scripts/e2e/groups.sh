@@ -208,6 +208,10 @@ R=$(BB "$B/api/stats/me?months=6")
 check "stats: 6M = 26 weekly buckets" '26' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
 R=$(BB "$B/api/stats/me?months=99")
 check "stats: silly range clamps to 6M" '26' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
+R=$(BB "$B/api/stats/me?weeks=9")
+check "stats: custom weeks honored"  '9' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
+R=$(BB "$B/api/stats/me?weeks=99")
+check "stats: custom weeks clamps to 26" '26' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
 R=$(DD $B/api/stats/me)
 check "stats: no history = zeros"   '"sessions_total":0' "$R"
 
