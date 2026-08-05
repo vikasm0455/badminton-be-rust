@@ -9,4 +9,5 @@ pub mod moderation;
 pub mod polls;
 pub mod push;
 pub mod reservations;
+pub mod stats;
 pub mod stream;

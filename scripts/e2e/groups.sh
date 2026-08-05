@@ -199,6 +199,14 @@ check "B belongs to 2 groups"       '2' "$(echo $R | jqf "len(d['data'])")"
 R=$(BB $B/api/kcal/today)
 check "kcal stays private shape"    '"my_log"' "$R"
 
+# ---- personal stats (B voted yes on APOLL earlier; attendance never confirmed)
+R=$(BB $B/api/stats/me)
+check "stats: yes-vote day counts as session" '"sessions_total":1' "$R"
+check "stats: 8 weekly buckets"     '8' "$(echo $R | jqf "len(d['data']['weekly_sessions'])")"
+check "stats: yes rate present"     '"yes_rate_percent":' "$R"
+R=$(DD $B/api/stats/me)
+check "stats: no history = zeros"   '"sessions_total":0' "$R"
+
 kill $API 2>/dev/null
 PSQL -d postgres -c "DROP DATABASE IF EXISTS rallyup_groups_e2e" >/dev/null
 rm -rf uploads_e2e /tmp/ck_a.txt /tmp/ck_b.txt /tmp/ck_c.txt

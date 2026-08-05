@@ -84,6 +84,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/join/:token", get(routes::groups::join_link_info).post(routes::groups::join_via_link))
         .route("/api/polls/:id/share-link", post(routes::polls::create_share_link))
         .route("/api/poll-share/:token", get(routes::polls::share_info))
+        .route("/api/stats/me", get(routes::stats::me))
         .route("/api/invites", get(routes::groups::my_invites))
         .route("/api/invites/:id/accept", post(routes::groups::accept_invite))
         .route("/api/invites/:id/decline", post(routes::groups::decline_invite))
@@ -212,6 +213,7 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         ("POST", "/api/join/:token") => "invite_link_joined",
         ("POST", "/api/polls/:id/share-link") => "poll_share_created",
         ("GET", "/api/poll-share/:token") => "poll_share_viewed",
+        ("GET", "/api/stats/me") => "stats_viewed",
         ("POST", "/api/invites/:id/accept") => "invite_accepted",
         ("PUT", "/api/groups/venue") => "venue_updated",
         ("POST", "/api/kcal") => "kcal_logged",
