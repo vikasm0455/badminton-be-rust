@@ -415,11 +415,15 @@ pub async fn scan_board(
     user: AuthUser,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<BoardScanResult>>, ApiError> {
-    let ctx = active_group(&state, user.id).await?;
+    // Cross-group like the manual Log Court list (scope=all): the login on
+    // the board may belong to any group the caller is in, not just whichever
+    // one happens to be active — the confirm step resolves the right group
+    // per match via /resolve-group, same as manual logging already does.
     let max_bytes = state.config.max_upload_size_mb * 1024 * 1024;
     let (bytes, content_type) = crate::upload::read_image_field(multipart, max_bytes).await?;
 
-    // Today's logins visible to this group + the court each is locked to (if any).
+    // Today's logins visible across ALL my groups + the court each is locked
+    // to (if any) — in-use is global, matching credentials::today's rule.
     let creds: Vec<(Uuid, String, Option<i16>)> = sqlx::query_as(
         "SELECT c.id, c.bintang_name,
                 (SELECT r.court_number FROM court_reservations r
@@ -430,11 +434,18 @@ pub async fn scan_board(
                    ORDER BY r.start_at DESC LIMIT 1) AS in_use_court
          FROM court_credentials c
          WHERE c.game_date = $1
-           AND EXISTS (SELECT 1 FROM credential_shares s
-                       WHERE s.credential_id = c.id AND s.group_id = $2)",
+           AND (c.posted_by = $2
+                OR EXISTS (SELECT 1 FROM credential_shares s
+                           JOIN group_members gm ON gm.group_id = s.group_id AND gm.user_id = $2
+                           WHERE s.credential_id = c.id))
+           AND NOT EXISTS (SELECT 1 FROM user_blocks ub
+                           WHERE ub.blocker_id = $2 AND ub.blocked_id = c.posted_by)
+           AND NOT EXISTS (SELECT 1 FROM content_reports cr
+                           WHERE cr.reporter_id = $2 AND cr.content_type = 'credential'
+                             AND cr.content_id = c.id)",
     )
     .bind(time::today())
-    .bind(ctx.group_id)
+    .bind(user.id)
     .fetch_all(&state.db)
     .await?;
 
