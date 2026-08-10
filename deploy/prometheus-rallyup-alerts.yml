@@ -1,8 +1,19 @@
-# RallyUp alert rules — drop into Prometheus rule_files (or recreate as
-# Grafana alerts if you alert from Grafana instead).
+# RallyUp alert rules — mounted into Prometheus at /etc/prometheus/rallyup-alerts.yml
+# and referenced from rule_files. Delivery: Alertmanager → ntfy-alertmanager → ntfy.
 groups:
   - name: rallyup
     rules:
+      # The one alert that matters most: the app is down. `up` is Prometheus's
+      # own per-scrape health metric, so this also fires if /metrics breaks.
+      - alert: RallyUpBackendDown
+        expr: up{job="rallyup"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RallyUp backend is DOWN"
+          description: "Prometheus can't scrape badminton-be-rust:8090 — the API is likely unreachable for everyone. Check `docker ps` / container logs."
+
       # Any replay of an already-used refresh token beyond the retry grace
       # window means someone presented a stolen token. Should be exactly zero.
       - alert: RefreshTokenReuseDetected
@@ -13,6 +24,29 @@ groups:
         annotations:
           summary: "Refresh-token reuse detected ({{ $value }} in 15m)"
           description: "A revoked/used refresh token was replayed — possible stolen session. The token family is already revoked server-side; investigate security_events for the user."
+
+      # OTP emails are the only way into the app — if Resend rejects or times
+      # out, nobody can sign up or log in. status is the HTTP code ("error" on
+      # transport failure), so anything non-2xx counts.
+      - alert: OtpEmailFailing
+        expr: sum(increase(downstream_requests_total{dependency="resend",status!~"2.."}[30m])) > 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sign-in emails failing ({{ $value }} Resend errors in 30m)"
+          description: "Resend is erroring — OTP codes aren't being delivered, which blocks all signups and logins. Check the Resend dashboard / API key."
+
+      # A burst of 5xx from the API itself (not the proxy) — something is
+      # crashing or a dependency (DB/Redis) is unhappy.
+      - alert: RallyUpErrorSpike
+        expr: sum(increase(http_requests_total{job="rallyup",status=~"5.."}[15m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API returning 5xx ({{ $value }} in 15m)"
+          description: "The backend is throwing server errors. Check container logs and Postgres/Redis health."
 
       # Push deliveries failing hard (excluding dead-token cleanup).
       - alert: PushDeliveryFailing
@@ -35,3 +69,25 @@ groups:
           severity: warning
         annotations:
           summary: "p95 over 1s on today-endpoints"
+
+  # Host health — the VM runs everything; if it fills up or runs out of
+  # memory, RallyUp goes down with it. Sourced from node-exporter.
+  - name: host
+    rules:
+      - alert: HostDiskLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Server disk under 10% free"
+          description: "Root filesystem is nearly full — docker images/logs are the usual culprits (`docker system prune`, journald logs)."
+
+      - alert: HostMemoryLow
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Server memory under 10% available"
+          description: "The VM is close to OOM — a container may be leaking; check `docker stats`."
