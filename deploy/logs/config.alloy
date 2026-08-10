@@ -22,6 +22,22 @@ loki.source.docker "containers" {
 	forward_to    = [loki.write.default.receiver]
 }
 
+// nginx writes real files (the ~/apps/nginx/logs mount replaces the image's
+// stdout symlinks), so the edge access/error logs are tailed directly.
+// Requires the compose mount: ~/apps/nginx/logs:/var/log/nginx:ro
+local.file_match "nginx" {
+	path_targets = [{
+		__path__  = "/var/log/nginx/*.log",
+		container = "nginx",
+		source    = "file",
+	}]
+}
+
+loki.source.file "nginx" {
+	targets    = local.file_match.nginx.targets
+	forward_to = [loki.write.default.receiver]
+}
+
 loki.write "default" {
 	endpoint {
 		url = "http://loki:3100/loki/api/v1/push"
