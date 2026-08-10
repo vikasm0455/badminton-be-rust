@@ -185,7 +185,9 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
 /// Every new user-facing endpoint gets a row here — that's the metrics rule.
 fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
     Some(match (method, endpoint) {
+        ("POST", "/api/auth/signup") => "signup_code_requested",
         ("POST", "/api/auth/signup/verify") => "signup_completed",
+        ("POST", "/api/auth/login") => "login_code_requested",
         ("POST", "/api/auth/login/verify") => "login_completed",
         ("POST", "/api/auth/token/refresh") => "session_refreshed",
         ("DELETE", "/api/auth/me") => "account_deleted",

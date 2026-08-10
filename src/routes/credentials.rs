@@ -11,7 +11,7 @@ use crate::error::ApiError;
 use crate::models::ApiResponse;
 use crate::routes::groups::{active_group, require_group_admin};
 use crate::state::{AppState, LiveEvent};
-use crate::{notify, ocr, security, time};
+use crate::{metrics, notify, ocr, security, time};
 use crate::security::event;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -307,8 +307,15 @@ pub async fn ocr_credential(
         }
     };
 
-    let pairs = ocr::extract(&state, &bytes, &content_type).await;
+    let (pairs, ocr_error) = match ocr::extract(&state, &bytes, &content_type).await {
+        Some(pairs) => (pairs, false),
+        None => (Vec::new(), true), // call failed — degrade to manual entry
+    };
     let ok = !pairs.is_empty();
+    metrics::record_ocr_scan(
+        "login",
+        if ocr_error { "error" } else if ok { "matched" } else { "no_match" },
+    );
     let message = match pairs.len() {
         0 => "Couldn't read it clearly — please add the login(s) manually.".to_string(),
         1 => "Review the login below and confirm.".to_string(),

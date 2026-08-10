@@ -1,0 +1,35 @@
+# --- Log-aggregation services -------------------------------------------
+# Documentation copy: merge these two services into the master
+# docker-compose.yml on the server (network: appnetwork).
+#
+# Also required in the master compose:
+#   1. Declare the named volume at top level:
+#        volumes:
+#          lokidata: {}
+#   2. Add to the existing grafana service's volumes:
+#        - ~/apps/grafana/provisioning:/etc/grafana/provisioning
+
+services:
+  loki:
+    image: grafana/loki:3.4.2
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - ~/apps/loki/loki.yml:/etc/loki/loki.yml:ro
+      - lokidata:/loki
+    networks:
+      - appnetwork
+    restart: always
+
+  alloy:
+    image: grafana/alloy:latest
+    command: run /etc/alloy/config.alloy --storage.path=/var/lib/alloy/data
+    volumes:
+      - ~/apps/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ~/apps/alloy/data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - appnetwork
+    restart: always
+
+volumes:
+  lokidata: {}

@@ -1,6 +1,6 @@
 //! Credential screenshot OCR via Claude Vision (PRD §6.1.1). Always degrades
-//! gracefully: on missing key, timeout, or unparseable output it returns empty
-//! fields so the UI falls back to manual entry.
+//! gracefully: on missing key, timeout, or unparseable output it returns `None`
+//! and callers fall back to manual entry (recording an "error" scan).
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -22,12 +22,14 @@ Extract EVERY login you can read, preserving order. \
 Respond with ONLY a JSON array, no prose: [{\"name\":\"...\",\"password\":\"...\"}]. \
 Use an empty string for an unreadable field. If you cannot read any login, return [].";
 
-pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> Vec<OcrPair> {
-    let empty: Vec<OcrPair> = Vec::new();
-
+/// OCR one credential image. `None` means the call never produced a readable
+/// response (missing key, HTTP error, timeout, unparseable body) — callers
+/// degrade to manual entry and count it as an "error" scan. `Some` means the
+/// model answered; the vec may still be empty (nothing usable in the image).
+pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> Option<Vec<OcrPair>> {
     let Some(api_key) = &state.config.anthropic_api_key else {
         tracing::info!("ANTHROPIC_API_KEY not set — OCR skipped, manual entry");
-        return empty;
+        return None;
     };
 
     let (img_bytes, media_type) = prepare_image(image, media_type);
@@ -64,11 +66,11 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> Vec<Oc
             let body = r.text().await.unwrap_or_default();
             let body: String = body.chars().take(600).collect();
             tracing::warn!(%status, body = %body, "Claude Vision returned error status");
-            return empty;
+            return None;
         }
         Err(e) => {
             tracing::warn!(error = %e, "Claude Vision request failed/timed out");
-            return empty;
+            return None;
         }
     };
 
@@ -76,19 +78,19 @@ pub async fn extract(state: &AppState, image: &[u8], media_type: &str) -> Vec<Oc
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "could not parse Claude response");
-            return empty;
+            return None;
         }
     };
 
-    // content[0].text holds the model's JSON string.
+    // content[0].text holds the model's JSON string. A 200 without it is an
+    // abnormal API reply — treat as a failed call (error), not an empty scan.
     let text = val
         .get("content")
         .and_then(|c| c.get(0))
         .and_then(|b| b.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+        .and_then(|t| t.as_str())?;
 
-    parse_logins(text)
+    Some(parse_logins(text))
 }
 
 /// Parse the model's JSON array of {name, password} logins, dropping blank rows.
@@ -158,12 +160,13 @@ Respond with ONLY a JSON array and nothing else, e.g. \
 [{\"court_number\":9,\"minutes_left\":19,\"current_players\":[\"Eric\",\"Eugene\"],\"queue\":[\"Younw\",\"Aishi\"]}]. \
 Skip any panel where you cannot read the court number.";
 
-/// OCR the whole status board into a list of court panels. Degrades to an empty
-/// list (manual entry) on missing key, timeout, or unparseable output.
-pub async fn extract_board(state: &AppState, image: &[u8], media_type: &str) -> Vec<BoardCourt> {
+/// OCR the whole status board into a list of court panels. Same contract as
+/// `extract`: `None` when the call failed outright (missing key, HTTP error,
+/// timeout, unparseable body); `Some` (possibly empty) when the model answered.
+pub async fn extract_board(state: &AppState, image: &[u8], media_type: &str) -> Option<Vec<BoardCourt>> {
     let Some(api_key) = &state.config.anthropic_api_key else {
         tracing::info!("ANTHROPIC_API_KEY not set — board scan skipped, manual entry");
-        return Vec::new();
+        return None;
     };
 
     let (img_bytes, media_type) = prepare_image(image, media_type);
@@ -194,11 +197,11 @@ pub async fn extract_board(state: &AppState, image: &[u8], media_type: &str) -> 
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::warn!(status = %r.status(), "board OCR returned error status");
-            return Vec::new();
+            return None;
         }
         Err(e) => {
             tracing::warn!(error = %e, "board OCR request failed/timed out");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -206,17 +209,17 @@ pub async fn extract_board(state: &AppState, image: &[u8], media_type: &str) -> 
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "could not parse board OCR response");
-            return Vec::new();
+            return None;
         }
     };
 
+    // Same as extract(): a 200 missing content[0].text is a failed call.
     let text = val
         .get("content")
         .and_then(|c| c.get(0))
         .and_then(|b| b.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    parse_board(text)
+        .and_then(|t| t.as_str())?;
+    Some(parse_board(text))
 }
 
 fn parse_board(text: &str) -> Vec<BoardCourt> {

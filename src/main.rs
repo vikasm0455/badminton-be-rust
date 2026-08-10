@@ -10,7 +10,7 @@ use rallyup_api::config::Config;
 use rallyup_api::net::RateLimiter;
 use rallyup_api::push::Vapid;
 use rallyup_api::state::AppState;
-use rallyup_api::{build_app, connect_redis, jobs, promote_admin, run_migrations};
+use rallyup_api::{build_app, connect_redis, jobs, metrics, promote_admin, run_migrations};
 
 #[tokio::main]
 async fn main() {
@@ -66,6 +66,8 @@ async fn main() {
 
     // Background scheduler (auto-poll, cleanups, timer notifications).
     jobs::spawn(state.clone());
+    // 60s gauge sampler (active_users, db_pool_connections).
+    metrics::spawn_samplers(state.clone());
 
     let static_dir = std::env::var("STATIC_DIR").ok().filter(|d| !d.is_empty());
     let app = build_app(state, static_dir);

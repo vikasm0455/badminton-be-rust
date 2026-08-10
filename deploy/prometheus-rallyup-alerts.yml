@@ -60,6 +60,17 @@ groups:
           summary: "More than half of push deliveries failing"
           description: "Check APNs/FCM credentials (expired .p8 / service account) and provider status."
 
+      # Connection pool starved — every connection checked out for 10 straight
+      # minutes means a leak or a stuck query; requests are queueing behind it.
+      - alert: DbPoolSaturated
+        expr: db_pool_connections{state="idle"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB pool has had zero idle connections for 10m"
+          description: "All Postgres connections are checked out — look for a long-running/stuck query (pg_stat_activity) or a connection leak in a new handler."
+
       # API latency regression on the hot mobile paths.
       - alert: MobileApiSlow
         expr: |

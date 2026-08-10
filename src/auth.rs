@@ -167,6 +167,7 @@ impl FromRequestParts<AppState> for SessionUser {
         if status == "deactivated" || status == "rejected" {
             return Err(ApiError::Unauthorized);
         }
+        touch_daily_active(state, parts, claims.sub);
         Ok(SessionUser {
             id: claims.sub,
             role: claims.role,
@@ -175,6 +176,25 @@ impl FromRequestParts<AppState> for SessionUser {
             exp: claims.exp,
         })
     }
+}
+
+/// Fire-and-forget DAU touch: SADD the user into today's per-client Redis set
+/// ("dau:<date>:<client>"), which the active_users gauge sampler reads
+/// (metrics::spawn_samplers). Best effort — metrics never block auth.
+fn touch_daily_active(state: &AppState, parts: &Parts, user_id: Uuid) {
+    let Some(mut redis) = state.redis.clone() else { return };
+    let client = if parts
+        .headers
+        .get("x-client")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("native"))
+    { "native" } else { "web" };
+    let key = format!("dau:{}:{client}", crate::time::today());
+    tokio::spawn(async move {
+        let _: Result<(), _> = redis.sadd(&key, user_id.to_string()).await;
+        // 8-day TTL keeps exactly the trailing week the 7d window unions.
+        let _: Result<(), _> = redis.expire(&key, 8 * 24 * 60 * 60).await;
+    });
 }
 
 /// An approved, active member. Pending users are rejected with 403 so the

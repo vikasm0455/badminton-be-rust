@@ -10,7 +10,7 @@ use crate::models::ApiResponse;
 use crate::ocr::BoardCourt;
 use crate::routes::groups::{GroupCtx, active_group, require_group_admin};
 use crate::state::{AppState, LiveEvent};
-use crate::{notify, ocr, time};
+use crate::{metrics, notify, ocr, time};
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct ReservationView {
@@ -449,10 +449,17 @@ pub async fn scan_board(
     .fetch_all(&state.db)
     .await?;
 
-    let board = ocr::extract_board(&state, &bytes, &content_type).await;
+    let (board, ocr_error) = match ocr::extract_board(&state, &bytes, &content_type).await {
+        Some(board) => (board, false),
+        None => (Vec::new(), true), // call failed — degrade to manual logging
+    };
     let detected = board.len();
 
     let matches = build_matches(&creds, &board);
+    metrics::record_ocr_scan(
+        "board",
+        if ocr_error { "error" } else if !matches.is_empty() { "matched" } else { "no_match" },
+    );
 
     let message = if detected == 0 {
         "Couldn't read the board clearly. Try a closer, straight-on photo — or log courts manually.".to_string()

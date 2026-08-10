@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: rallyup
+    type: file
+    foldersFromFilesStructure: false
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
