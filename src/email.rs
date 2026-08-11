@@ -8,7 +8,9 @@ use crate::state::AppState;
 
 async fn send_email(state: &AppState, to: &str, subject: &str, text: &str) -> Result<(), ApiError> {
     let Some(api_key) = &state.config.resend_api_key else {
-        tracing::info!(email = to, subject, text, "RESEND_API_KEY not set — email logged");
+        // Recipient + subject only: bodies carry OTP codes and temp passwords,
+        // which must never land in server logs.
+        tracing::info!(email = to, subject, "RESEND_API_KEY not set — email suppressed (body redacted)");
         return Ok(());
     };
 
@@ -46,6 +48,37 @@ pub async fn send_otp(state: &AppState, to: &str, code: &str) -> Result<(), ApiE
         &format!(
             "Your RallyUp code is {code}.\n\n\
              It expires in 5 minutes. If you didn't request this, you can ignore this email."
+        ),
+    )
+    .await
+}
+
+/// Courts onboarding: mail the club admin their sign-in email + temp password.
+pub async fn send_club_admin_invite(
+    state: &AppState,
+    to: &str,
+    club_name: &str,
+    slug: &str,
+    temp_password: &str,
+) -> Result<(), ApiError> {
+    let base = state
+        .config
+        .app_base_url
+        .as_deref()
+        .unwrap_or("https://badmintonrallyup.com");
+    send_email(
+        state,
+        to,
+        &format!("{club_name} is ready on RallyUp Courts"),
+        &format!(
+            "Hi,\n\n\
+             Your club \"{club_name}\" has been set up on RallyUp Courts.\n\n\
+             Admin console: {base}/courts/{slug}/admin\n\
+             Sign in with this email address and the temporary password below — \
+             you'll be asked to choose your own on first login.\n\n\
+             Temporary password: {temp_password}\n\n\
+             Kiosk board (share with the front desk): {base}/courts/{slug}\n\n\
+             — RallyUp Courts"
         ),
     )
     .await

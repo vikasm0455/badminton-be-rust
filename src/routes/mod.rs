@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod clubs;
 pub mod config;
 pub mod credentials;
 pub mod groups;

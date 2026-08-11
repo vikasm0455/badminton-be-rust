@@ -62,12 +62,15 @@ async fn main() {
         native,
         events,
         rate_api: Arc::new(RateLimiter::new(100, Duration::from_secs(60))),
+        club_events: rallyup_api::state::new_club_events(),
     };
 
     // Background scheduler (auto-poll, cleanups, timer notifications).
     jobs::spawn(state.clone());
     // 60s gauge sampler (active_users, db_pool_connections).
     metrics::spawn_samplers(state.clone());
+    // Courts expiry engine (3s tick: promote / auto-extend / clear).
+    rallyup_api::courts::spawn_engine(state.clone());
 
     let static_dir = std::env::var("STATIC_DIR").ok().filter(|d| !d.is_empty());
     let app = build_app(state, static_dir);

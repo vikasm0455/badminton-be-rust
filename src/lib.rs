@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod courts;
 pub mod downstream;
 pub mod email;
 pub mod error;
@@ -141,6 +142,35 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
             "/api/config/auto-poll",
             get(routes::config::get_auto_poll).put(routes::config::set_auto_poll),
         )
+        // ---- courts: platform console --------------------------------------
+        .route("/api/platform/otp", post(routes::clubs::platform_otp))
+        .route("/api/platform/verify", post(routes::clubs::platform_verify))
+        .route(
+            "/api/platform/clubs",
+            get(routes::clubs::platform_list_clubs).post(routes::clubs::platform_create_club),
+        )
+        .route("/api/platform/clubs/:id", axum::routing::patch(routes::clubs::platform_patch_club))
+        // ---- courts: club admin console ------------------------------------
+        .route("/api/clubs/:slug/admin/login", post(routes::clubs::admin_login))
+        .route("/api/clubs/:slug/admin/password", post(routes::clubs::admin_change_password))
+        .route("/api/clubs/:slug/admin/overview", get(routes::clubs::admin_overview))
+        .route("/api/clubs/:slug/admin/config", axum::routing::patch(routes::clubs::admin_patch_config))
+        .route("/api/clubs/:slug/admin/courts/:n/close", post(routes::clubs::admin_close_court))
+        .route("/api/clubs/:slug/admin/courts/:n/reopen", post(routes::clubs::admin_reopen_court))
+        .route(
+            "/api/clubs/:slug/admin/credentials",
+            get(routes::clubs::admin_list_credentials).post(routes::clubs::admin_issue_credential),
+        )
+        .route(
+            "/api/clubs/:slug/admin/credentials/:id/revoke",
+            post(routes::clubs::admin_revoke_credential),
+        )
+        // ---- courts: kiosk (public per slug) --------------------------------
+        .route("/api/clubs/:slug/board", get(routes::clubs::board))
+        .route("/api/clubs/:slug/board/stream", get(routes::clubs::board_stream))
+        .route("/api/clubs/:slug/take", post(routes::clubs::kiosk_take))
+        .route("/api/clubs/:slug/join", post(routes::clubs::kiosk_join))
+        .route("/api/clubs/:slug/queue", post(routes::clubs::kiosk_queue))
         // ---- admin ---------------------------------------------------------
         .route("/api/admin/members", get(routes::admin::list_members))
         .route("/api/admin/members/:id", get(routes::admin::member_detail))
@@ -223,6 +253,16 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         ("POST", "/api/moderation/block") => "user_blocked",
         ("DELETE", "/api/moderation/block/:id") => "user_unblocked",
         ("POST", "/api/push/device") => "device_registered",
+        // Courts (kiosk_queue_promoted / kiosk_session_auto_extended are
+        // recorded by the engine directly — no HTTP request to hook).
+        ("POST", "/api/platform/clubs") => "club_onboarded",
+        ("PATCH", "/api/clubs/:slug/admin/config") => "club_config_saved",
+        ("POST", "/api/clubs/:slug/admin/credentials") => "club_credential_issued",
+        ("POST", "/api/clubs/:slug/admin/credentials/:id/revoke") => "club_credential_revoked",
+        ("POST", "/api/clubs/:slug/admin/login") => "club_admin_login",
+        ("POST", "/api/clubs/:slug/take") => "kiosk_court_taken",
+        ("POST", "/api/clubs/:slug/join") => "kiosk_court_joined",
+        ("POST", "/api/clubs/:slug/queue") => "kiosk_queue_joined",
         _ => return None,
     })
 }

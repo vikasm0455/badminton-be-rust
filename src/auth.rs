@@ -115,7 +115,7 @@ pub async fn revoke_all_for_user(state: &AppState, user_id: Uuid) {
     }
 }
 
-async fn is_revoked(state: &AppState, claims: &Claims) -> bool {
+pub async fn is_revoked(state: &AppState, claims: &Claims) -> bool {
     let Some(mut redis) = state.redis.clone() else {
         return false; // no Redis → fail open (blocklist unavailable)
     };

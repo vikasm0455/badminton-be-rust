@@ -29,6 +29,8 @@ const LOCKOUT_WINDOW_SECS: i64 = 24 * 60 * 60;
 pub enum OtpPurpose {
     Signup,
     Login,
+    /// Courts platform-admin sign-in (otp:platform:<email>).
+    Platform,
 }
 
 impl OtpPurpose {
@@ -36,6 +38,7 @@ impl OtpPurpose {
         match self {
             OtpPurpose::Signup => "signup",
             OtpPurpose::Login => "login",
+            OtpPurpose::Platform => "platform",
         }
     }
 }
@@ -196,7 +199,13 @@ pub async fn store_code(
 /// inboxes, so the env-designated emails (comma-list) may sign in with a
 /// static code. Disabled unless BOTH env vars are set; applies to those
 /// emails only; every other account keeps the normal emailed-OTP flow.
-fn review_bypass(email: &str, submitted: &str) -> bool {
+/// Scoped to member Signup/Login ONLY — the Courts platform console must
+/// always require a freshly emailed OTP, even if the platform admin email
+/// happens to appear in REVIEW_LOGIN_EMAIL.
+fn review_bypass(purpose: OtpPurpose, email: &str, submitted: &str) -> bool {
+    if !matches!(purpose, OtpPurpose::Signup | OtpPurpose::Login) {
+        return false;
+    }
     match std::env::var("REVIEW_LOGIN_CODE") {
         Ok(review_code) => {
             !review_code.is_empty()
@@ -213,7 +222,7 @@ pub async fn verify_code(
     email: &str,
     submitted: &str,
 ) -> Result<VerifyResult, ApiError> {
-    if review_bypass(email, submitted) {
+    if review_bypass(purpose, email, submitted) {
         return Ok(VerifyResult::Ok);
     }
     let mut r = redis(state)?;
@@ -274,6 +283,60 @@ pub async fn clear_account_lock(state: &AppState, email: &str) {
         let _: Result<(), _> = r.del(format!("lockflag:{email}")).await;
         let _: Result<(), _> = r.del(format!("failcount:{email}")).await;
     }
+}
+
+// ---- Courts kiosk: per-username password-guess lockout ----------------------
+//
+// Kiosk credential passwords are deliberately desk-friendly (word-word-NN),
+// so the real defence is cutting off guessing: after KIOSK_FAIL_THRESHOLD
+// wrong-password attempts on one username within the window, the username is
+// refused outright for the window with a generic message. Mirrors the OTP
+// note_login_failure/is_account_locked machinery, keyed per club + username.
+// These take the Redis handle directly (rather than &AppState) so the courts
+// domain tests can exercise them against a bare connection.
+
+const KIOSK_FAIL_THRESHOLD: u32 = 10; // wrong passwords per username / 1h
+const KIOSK_FAIL_WINDOW_SECS: i64 = 60 * 60;
+// The lock itself is shorter than the counting window: it fully neutralises
+// online guessing of the ~2^20 password space (10 tries/15min ≈ 40/h — a
+// multi-year brute force), while a bystander maliciously locking a visible
+// username strands the real player for minutes, not an hour.
+const KIOSK_LOCK_SECS: u64 = 15 * 60;
+
+fn kiosk_key(kind: &str, club_id: Uuid, username: &str) -> String {
+    format!("kiosk_{kind}:{club_id}:{}", username.trim().to_lowercase())
+}
+
+/// Record one wrong-password attempt against a kiosk username. Returns true
+/// when this attempt crossed the threshold (username just got locked).
+pub async fn note_kiosk_bad_password(
+    redis: Option<redis::aio::ConnectionManager>,
+    club_id: Uuid,
+    username: &str,
+) -> bool {
+    let Some(mut r) = redis else { return false };
+    let key = kiosk_key("fail", club_id, username);
+    let count: u32 = r.incr(&key, 1).await.unwrap_or(0);
+    let _: Result<(), _> = r.expire(&key, KIOSK_FAIL_WINDOW_SECS).await;
+    if count >= KIOSK_FAIL_THRESHOLD {
+        let _: Result<(), _> = r
+            .set_ex(kiosk_key("lock", club_id, username), 1, KIOSK_LOCK_SECS)
+            .await;
+        return count == KIOSK_FAIL_THRESHOLD;
+    }
+    false
+}
+
+pub async fn is_kiosk_username_locked(
+    redis: Option<redis::aio::ConnectionManager>,
+    club_id: Uuid,
+    username: &str,
+) -> bool {
+    // FAIL CLOSED: the lockout is the only defence the deliberately small
+    // kiosk password space relies on, so a Redis outage must refuse kiosk
+    // actions rather than open unlimited guessing (same posture as OTP).
+    let Some(mut r) = redis else { return true };
+    r.exists(kiosk_key("lock", club_id, username)).await.unwrap_or(true)
 }
 
 /// Invite-code attempt limiter (PRD §4.3: 10 per IP per hour).

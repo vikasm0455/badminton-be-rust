@@ -19,6 +19,9 @@ pub struct Config {
     pub moderation_notify_email: String,
     /// The owner's email — always treated as admin (PRD §3, single admin v1).
     pub admin_email: Option<String>,
+    /// The only email allowed into the Courts platform console
+    /// (PLATFORM_ADMIN_EMAIL; falls back to ADMIN_EMAIL when unset).
+    pub platform_admin_email: Option<String>,
     /// VAPID contact subject, e.g. "mailto:admin@boyishesh.com".
     pub vapid_subject: String,
     /// Where credential screenshots are written (cleared nightly).
@@ -82,6 +85,12 @@ impl Config {
             .map(|e| e.trim().to_lowercase())
             .filter(|e| !e.is_empty());
 
+        let platform_admin_email = env::var("PLATFORM_ADMIN_EMAIL")
+            .ok()
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty())
+            .or_else(|| admin_email.clone());
+
         let vapid_subject = env::var("VAPID_SUBJECT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -131,6 +140,7 @@ impl Config {
             moderation_notify_email,
             anthropic_model,
             admin_email,
+            platform_admin_email,
             vapid_subject,
             uploads_path,
             max_upload_size_mb,

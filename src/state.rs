@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::native_push::NativePush;
@@ -43,11 +45,46 @@ pub struct AppState {
     pub events: broadcast::Sender<LiveEvent>,
     /// Global per-IP API rate limiter (PRD §19.3: 100 req/min/IP).
     pub rate_api: Arc<RateLimiter>,
+    /// Per-club nudge channels for the Courts kiosk board SSE
+    /// (/api/clubs/{slug}/board/stream). Subscribers rebuild the board on
+    /// every nudge; the channel carries no payload.
+    pub club_events: ClubEvents,
+}
+
+/// Lazily-created broadcast channel per club. A plain Mutex<HashMap> is enough:
+/// lock hold time is a map lookup, and the fan-out itself happens outside it.
+pub type ClubEvents = Arc<Mutex<HashMap<Uuid, broadcast::Sender<()>>>>;
+
+pub fn new_club_events() -> ClubEvents {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 impl AppState {
     /// Best-effort broadcast — ignores the "no subscribers" error.
     pub fn broadcast(&self, event: LiveEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Get (or create) the nudge channel for one club's kiosk board.
+    /// Opportunistically evicts channels no kiosk is listening to any more
+    /// (skipping the club being fetched), so the map tracks live clubs rather
+    /// than every club ever streamed.
+    pub fn club_channel(&self, club_id: Uuid) -> broadcast::Sender<()> {
+        let mut map = self.club_events.lock().expect("club_events lock");
+        map.retain(|id, tx| *id == club_id || tx.receiver_count() > 0);
+        map.entry(club_id)
+            .or_insert_with(|| broadcast::channel(64).0)
+            .clone()
+    }
+
+    /// Nudge every kiosk streaming this club's board (best effort).
+    pub fn notify_club(&self, club_id: Uuid) {
+        let sender = {
+            let map = self.club_events.lock().expect("club_events lock");
+            map.get(&club_id).cloned()
+        };
+        if let Some(tx) = sender {
+            let _ = tx.send(());
+        }
     }
 }
