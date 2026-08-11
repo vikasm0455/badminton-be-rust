@@ -12,7 +12,7 @@ name = "reset-admin-otp"
 path = "src/bin/reset_admin_otp.rs"
 
 [dependencies]
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 tokio-cron-scheduler = "0.13"
 serde = { version = "1", features = ["derive"] }
