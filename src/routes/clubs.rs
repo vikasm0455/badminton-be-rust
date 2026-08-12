@@ -570,6 +570,52 @@ pub async fn admin_login(
     }))))
 }
 
+/// Slug-less club-admin sign-in for the marketing landing's "Club admin
+/// sign-in" door: the admin gives only their email + password, and we resolve
+/// which club they run (club_admins.email is globally UNIQUE, so one email
+/// maps to exactly one admin/club). Mirrors admin_login's lockout + argon2
+/// timing-safety, keyed on the email alone.
+pub async fn admin_login_by_email(
+    State(state): State<AppState>,
+    Json(req): Json<AdminLoginReq>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let email = req.email.trim().to_lowercase();
+    let lock_scope = format!("club-admin-email:{email}");
+    if otp::is_account_locked(&state, &lock_scope).await {
+        return Err(ApiError::RateLimited(
+            "Too many failed sign-ins. Please try again later.".into(),
+        ));
+    }
+    let row: Option<(Uuid, String, String, bool, String, String)> = sqlx::query_as(
+        "SELECT a.id, a.name, a.password_hash, a.must_change, c.slug, c.name
+         FROM club_admins a JOIN clubs c ON c.id = a.club_id
+         WHERE LOWER(a.email) = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&state.db)
+    .await?;
+    let bad = || ApiError::BadRequest("Incorrect email or password.".into());
+    let Some((id, name, hash, must_change, slug, club_name)) = row else {
+        // Burn the same argon2 time as a real verification so response timing
+        // can't enumerate admin emails.
+        verify_password(req.password.trim(), dummy_hash());
+        otp::note_login_failure(&state, &lock_scope).await;
+        return Err(bad());
+    };
+    if !verify_password(req.password.trim(), &hash) {
+        otp::note_login_failure(&state, &lock_scope).await;
+        return Err(bad());
+    }
+    let token = issue_token_for(id, "club_admin", &state.config.jwt_secret, COURTS_TOKEN_DAYS)?;
+    Ok(Json(ApiResponse::ok(json!({
+        "token": token,
+        "must_change": must_change,
+        "name": name,
+        "email": email,
+        "club": { "slug": slug, "name": club_name },
+    }))))
+}
+
 #[derive(Deserialize)]
 pub struct ChangePasswordReq {
     pub current: String,

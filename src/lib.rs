@@ -151,6 +151,7 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         )
         .route("/api/platform/clubs/:id", axum::routing::patch(routes::clubs::platform_patch_club))
         // ---- courts: club admin console ------------------------------------
+        .route("/api/courts/admin/login", post(routes::clubs::admin_login_by_email))
         .route("/api/clubs/:slug/admin/login", post(routes::clubs::admin_login))
         .route("/api/clubs/:slug/admin/password", post(routes::clubs::admin_change_password))
         .route("/api/clubs/:slug/admin/overview", get(routes::clubs::admin_overview))
