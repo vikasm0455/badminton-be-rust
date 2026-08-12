@@ -339,6 +339,141 @@ pub async fn is_kiosk_username_locked(
     r.exists(kiosk_key("lock", club_id, username)).await.unwrap_or(true)
 }
 
+// ---- Courts v2 stations: walk-in creation cap + check-in ref lockout ---------
+
+/// Walk-in station squatting cap: one IP may create at most this many
+/// usernames per rolling day. Generous for a shared signup station (a busy
+/// day is dozens of walk-ins), fatal for a script hoarding the namespace.
+const WALKIN_CREATE_MAX_PER_IP: u32 = 30;
+const WALKIN_CREATE_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Enforce the per-IP walk-in creation cap (30/day). Sliding window, same
+/// machinery as the OTP request limits; fails open without Redis (creation is
+/// not an auth factor — the kiosk lockouts stay fail-closed).
+pub async fn check_walkin_create_cap(
+    state: &AppState,
+    club_id: Uuid,
+    ip: IpAddr,
+) -> Result<(), ApiError> {
+    let (ok, _retry) = sliding_window(
+        state,
+        &format!("walkin_create:{club_id}:{ip}"),
+        WALKIN_CREATE_MAX_PER_IP,
+        WALKIN_CREATE_WINDOW_SECS,
+    )
+    .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::RateLimited(
+            "Too many signups from this station today. Please see the front desk.".into(),
+        ))
+    }
+}
+
+/// Walk-in availability-probe cap: walkin_check answers "taken" for member
+/// usernames too, so an unmetered probe is a member-roster oracle. Light cap —
+/// a real station types a few characters per signup, nowhere near 120/h.
+const WALKIN_PROBE_MAX_PER_IP: u32 = 120;
+const WALKIN_PROBE_WINDOW_SECS: i64 = 60 * 60;
+
+/// Per-IP cap on walk-in availability probes (120/hour). Fails open without
+/// Redis, like the other request limiters.
+pub async fn check_walkin_probe_cap(
+    state: &AppState,
+    club_id: Uuid,
+    ip: IpAddr,
+) -> Result<(), ApiError> {
+    let (ok, _retry) = sliding_window(
+        state,
+        &format!("walkin_probe:{club_id}:{ip}"),
+        WALKIN_PROBE_MAX_PER_IP,
+        WALKIN_PROBE_WINDOW_SECS,
+    )
+    .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::RateLimited(
+            "Too many lookups from this station. Please see the front desk.".into(),
+        ))
+    }
+}
+
+/// Check-in enumeration cap: a cap on ALL check-in attempts (valid or not).
+/// The unknown-ref lockout below only counts MISSES, but a HIT hands out the
+/// member's real day-pass password — so a station IP walking a dense/sequential
+/// card-number space must be rate-limited regardless of hit ratio. 60/hour is
+/// far above any real front-desk scanner's pace.
+const CHECKIN_ATTEMPT_MAX_PER_IP: u32 = 60;
+const CHECKIN_ATTEMPT_WINDOW_SECS: i64 = 60 * 60;
+
+/// Per-IP sliding cap on all check-in attempts (60/hour). Fails open without
+/// Redis like the other request limiters — that is fine here ONLY because the
+/// unknown-ref lockout (is_checkin_locked) stays fail-closed underneath it.
+pub async fn check_checkin_attempt_cap(
+    state: &AppState,
+    club_id: Uuid,
+    ip: IpAddr,
+) -> Result<(), ApiError> {
+    let (ok, _retry) = sliding_window(
+        state,
+        &format!("checkin_attempt:{club_id}:{ip}"),
+        CHECKIN_ATTEMPT_MAX_PER_IP,
+        CHECKIN_ATTEMPT_WINDOW_SECS,
+    )
+    .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::RateLimited(
+            "Too many check-ins from this station right now. Please try again later.".into(),
+        ))
+    }
+}
+
+// Member check-in station: unknown member IDs count toward a per-club+IP
+// lockout, mirroring the kiosk wrong-password lockout (member_ref is the only
+// secret in the check-in flow, so enumeration must be cut off the same way).
+const CHECKIN_FAIL_THRESHOLD: u32 = 10; // unknown refs per IP / 1h
+const CHECKIN_FAIL_WINDOW_SECS: i64 = 60 * 60;
+const CHECKIN_LOCK_SECS: u64 = 15 * 60;
+
+fn checkin_key(kind: &str, club_id: Uuid, ip: IpAddr) -> String {
+    format!("checkin_{kind}:{club_id}:{ip}")
+}
+
+/// Record one unknown-member_ref attempt from this IP. Returns true when this
+/// attempt crossed the threshold (station just got locked).
+pub async fn note_checkin_unknown_ref(
+    redis: Option<redis::aio::ConnectionManager>,
+    club_id: Uuid,
+    ip: IpAddr,
+) -> bool {
+    let Some(mut r) = redis else { return false };
+    let key = checkin_key("fail", club_id, ip);
+    let count: u32 = r.incr(&key, 1).await.unwrap_or(0);
+    let _: Result<(), _> = r.expire(&key, CHECKIN_FAIL_WINDOW_SECS).await;
+    if count >= CHECKIN_FAIL_THRESHOLD {
+        let _: Result<(), _> = r
+            .set_ex(checkin_key("lock", club_id, ip), 1, CHECKIN_LOCK_SECS)
+            .await;
+        return count == CHECKIN_FAIL_THRESHOLD;
+    }
+    false
+}
+
+/// FAIL CLOSED like the kiosk password lockout: member IDs are guessable card
+/// numbers, so a Redis outage must refuse check-ins, not open enumeration.
+pub async fn is_checkin_locked(
+    redis: Option<redis::aio::ConnectionManager>,
+    club_id: Uuid,
+    ip: IpAddr,
+) -> bool {
+    let Some(mut r) = redis else { return true };
+    r.exists(checkin_key("lock", club_id, ip)).await.unwrap_or(true)
+}
+
 /// Invite-code attempt limiter (PRD §4.3: 10 per IP per hour).
 // LEGACY-SINGLE-TENANT: no callers since invite codes were replaced by group email
 // invites — delete with the invite-code system.

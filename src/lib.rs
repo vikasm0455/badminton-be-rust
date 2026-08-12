@@ -157,13 +157,24 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/clubs/:slug/admin/config", axum::routing::patch(routes::clubs::admin_patch_config))
         .route("/api/clubs/:slug/admin/courts/:n/close", post(routes::clubs::admin_close_court))
         .route("/api/clubs/:slug/admin/courts/:n/reopen", post(routes::clubs::admin_reopen_court))
+        // v2: credentials are read-only for staff (today's logins, passwords
+        // visible) — the v1 issue endpoint is deleted; players self-serve at
+        // the walk-in / check-in stations.
         .route(
             "/api/clubs/:slug/admin/credentials",
-            get(routes::clubs::admin_list_credentials).post(routes::clubs::admin_issue_credential),
+            get(routes::clubs::admin_list_credentials),
         )
         .route(
             "/api/clubs/:slug/admin/credentials/:id/revoke",
             post(routes::clubs::admin_revoke_credential),
+        )
+        .route(
+            "/api/clubs/:slug/admin/members",
+            get(routes::clubs::admin_list_members).post(routes::clubs::admin_add_member),
+        )
+        .route(
+            "/api/clubs/:slug/admin/members/:id/remove",
+            post(routes::clubs::admin_remove_member),
         )
         // ---- courts: kiosk (public per slug) --------------------------------
         .route("/api/clubs/:slug/board", get(routes::clubs::board))
@@ -171,6 +182,12 @@ pub fn build_app(state: AppState, static_dir: Option<String>) -> Router {
         .route("/api/clubs/:slug/take", post(routes::clubs::kiosk_take))
         .route("/api/clubs/:slug/join", post(routes::clubs::kiosk_join))
         .route("/api/clubs/:slug/queue", post(routes::clubs::kiosk_queue))
+        .route("/api/clubs/:slug/leave", post(routes::clubs::kiosk_leave))
+        .route("/api/clubs/:slug/queue/leave", post(routes::clubs::kiosk_queue_leave))
+        // ---- courts: walk-in + member check-in stations ---------------------
+        .route("/api/clubs/:slug/walkin/check", post(routes::clubs::walkin_check))
+        .route("/api/clubs/:slug/walkin/create", post(routes::clubs::walkin_create))
+        .route("/api/clubs/:slug/checkin", post(routes::clubs::member_checkin))
         // ---- admin ---------------------------------------------------------
         .route("/api/admin/members", get(routes::admin::list_members))
         .route("/api/admin/members/:id", get(routes::admin::member_detail))
@@ -257,12 +274,17 @@ fn feature_event(method: &str, endpoint: &str) -> Option<&'static str> {
         // recorded by the engine directly — no HTTP request to hook).
         ("POST", "/api/platform/clubs") => "club_onboarded",
         ("PATCH", "/api/clubs/:slug/admin/config") => "club_config_saved",
-        ("POST", "/api/clubs/:slug/admin/credentials") => "club_credential_issued",
         ("POST", "/api/clubs/:slug/admin/credentials/:id/revoke") => "club_credential_revoked",
         ("POST", "/api/clubs/:slug/admin/login") => "club_admin_login",
+        ("POST", "/api/clubs/:slug/admin/members") => "club_member_added",
+        ("POST", "/api/clubs/:slug/admin/members/:id/remove") => "club_member_removed",
         ("POST", "/api/clubs/:slug/take") => "kiosk_court_taken",
         ("POST", "/api/clubs/:slug/join") => "kiosk_court_joined",
         ("POST", "/api/clubs/:slug/queue") => "kiosk_queue_joined",
+        ("POST", "/api/clubs/:slug/leave") => "court_left",
+        ("POST", "/api/clubs/:slug/queue/leave") => "queue_left",
+        ("POST", "/api/clubs/:slug/walkin/create") => "walkin_created",
+        ("POST", "/api/clubs/:slug/checkin") => "member_checkin",
         _ => return None,
     })
 }

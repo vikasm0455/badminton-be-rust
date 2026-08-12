@@ -7,7 +7,7 @@ use std::convert::Infallible;
 
 use axum::Json;
 use axum::async_trait;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -204,9 +204,13 @@ fn club_json(club: &ClubRow) -> Value {
         "closes_at": club.closes_at.format("%H:%M").to_string(),
         "kiosk_theme": club.kiosk_theme,
         "status": club.status,
+        "timezone": club.timezone,
         "created_at": club.created_at.to_rfc3339(),
     })
 }
+
+/// v2 court cap (config + platform create).
+const MAX_COURTS: i32 = 100;
 
 /// UTC instant of today's local midnight — "today" filters for issued_at etc.
 fn local_midnight_utc() -> DateTime<Utc> {
@@ -337,6 +341,7 @@ pub struct CreateClubReq {
     pub court_count: i32,
     pub session_minutes: Option<i32>,
     pub queue_depth: Option<i32>,
+    pub timezone: Option<String>,
     pub admin_name: String,
     pub admin_email: String,
 }
@@ -375,8 +380,10 @@ pub async fn platform_create_club(
     if admin_name.is_empty() {
         return Err(ApiError::BadRequest("admin name is required".into()));
     }
-    if !(1..=50).contains(&req.court_count) {
-        return Err(ApiError::BadRequest("court count must be between 1 and 50".into()));
+    if !(1..=MAX_COURTS).contains(&req.court_count) {
+        return Err(ApiError::BadRequest(format!(
+            "court count must be between 1 and {MAX_COURTS}"
+        )));
     }
     let session_minutes = req.session_minutes.unwrap_or(45);
     if !(5..=240).contains(&session_minutes) {
@@ -390,14 +397,23 @@ pub async fn platform_create_club(
     if !valid_color(&brand_color) {
         return Err(ApiError::BadRequest("brand color must be a #rrggbb hex value".into()));
     }
+    // Day passes hinge on the club's "today", so the timezone must be a real
+    // IANA name chrono-tz can resolve — validated with the SAME parser the
+    // runtime uses.
+    let timezone = req.timezone.unwrap_or_else(|| "America/Los_Angeles".to_string());
+    if courts::parse_timezone(&timezone).is_none() {
+        return Err(ApiError::BadRequest(
+            "timezone must be a valid IANA name like America/Los_Angeles".into(),
+        ));
+    }
 
     let temp_password = courts::generate_admin_password();
     let password_hash = hash_password(&temp_password)?;
 
     let mut tx = state.db.begin().await?;
     let club: Result<ClubRow, sqlx::Error> = sqlx::query_as(&format!(
-        "INSERT INTO clubs (slug, name, brand_color, court_count, session_minutes, queue_depth)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {}",
+        "INSERT INTO clubs (slug, name, brand_color, court_count, session_minutes, queue_depth, timezone)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {}",
         courts::CLUB_COLUMNS
     ))
     .bind(&slug)
@@ -406,6 +422,7 @@ pub async fn platform_create_club(
     .bind(req.court_count)
     .bind(session_minutes)
     .bind(queue_depth)
+    .bind(timezone.trim())
     .fetch_one(&mut *tx)
     .await;
     let club = club.map_err(|e| match &e {
@@ -616,19 +633,23 @@ pub async fn admin_overview(
             .bind(club.id)
             .fetch_one(&state.db)
             .await?;
+    // "Today" is the club's calendar day — the same day passes are keyed by.
     let (credentials_today,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM club_credentials WHERE club_id = $1 AND issued_at >= $2",
+        "SELECT COUNT(*) FROM club_credentials WHERE club_id = $1 AND valid_date = $2",
     )
     .bind(club.id)
-    .bind(local_midnight_utc())
+    .bind(club.today())
     .fetch_one(&state.db)
     .await?;
-    let courts: Vec<(i32, bool, Option<String>)> = sqlx::query_as(
-        "SELECT number, closed, closed_reason FROM club_courts WHERE club_id = $1 ORDER BY number",
-    )
-    .bind(club.id)
-    .fetch_all(&state.db)
-    .await?;
+    let courts: Vec<(i32, bool, Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
+        sqlx::query_as(&format!(
+            "SELECT number, {}, closed_reason, closed_from, closed_until
+             FROM club_courts WHERE club_id = $1 ORDER BY number",
+            courts::COURT_CLOSED_SQL
+        ))
+        .bind(club.id)
+        .fetch_all(&state.db)
+        .await?;
 
     Ok(Json(ApiResponse::ok(json!({
         "config": club_json(&club),
@@ -640,8 +661,12 @@ pub async fn admin_overview(
         },
         "courts": courts
             .into_iter()
-            .map(|(number, closed, closed_reason)| json!({
-                "number": number, "closed": closed, "closed_reason": closed_reason,
+            .map(|(number, closed, closed_reason, closed_from, closed_until)| json!({
+                "number": number,
+                "closed": closed,
+                "closed_reason": closed_reason,
+                "closed_from": closed_from.map(|t| t.to_rfc3339()),
+                "closed_until": closed_until.map(|t| t.to_rfc3339()),
             }))
             .collect::<Vec<_>>(),
     }))))
@@ -657,6 +682,7 @@ pub struct PatchConfigReq {
     pub closes_at: Option<String>,
     pub kiosk_theme: Option<String>,
     pub brand_color: Option<String>,
+    pub timezone: Option<String>,
 }
 
 pub async fn admin_patch_config(
@@ -671,8 +697,17 @@ pub async fn admin_patch_config(
     // Validate EVERY field before touching the database, so a bad later field
     // can never leave the config half-applied.
     if let Some(n) = req.court_count {
-        if !(1..=50).contains(&n) {
-            return Err(ApiError::BadRequest("court count must be between 1 and 50".into()));
+        if !(1..=MAX_COURTS).contains(&n) {
+            return Err(ApiError::BadRequest(format!(
+                "court count must be between 1 and {MAX_COURTS}"
+            )));
+        }
+    }
+    if let Some(tz) = &req.timezone {
+        if courts::parse_timezone(tz).is_none() {
+            return Err(ApiError::BadRequest(
+                "timezone must be a valid IANA name like America/Los_Angeles".into(),
+            ));
         }
     }
     if let Some(m) = req.session_minutes {
@@ -782,6 +817,13 @@ pub async fn admin_patch_config(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(tz) = &req.timezone {
+        sqlx::query("UPDATE clubs SET timezone = $1 WHERE id = $2")
+            .bind(tz.trim())
+            .bind(club.id)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
 
     state.notify_club(club.id);
@@ -793,11 +835,39 @@ pub async fn admin_patch_config(
 
 #[derive(Deserialize)]
 pub struct CloseCourtReq {
-    pub reason: Option<String>,
+    pub reason: String,
+    /// Optional start; defaults to now. Accepts RFC3339, "YYYY-MM-DDTHH:MM"
+    /// (club-local), or "HH:MM" (today, club-local — the admin modal's shape).
+    pub from: Option<String>,
+    /// Required end of the window, same formats.
+    pub until: String,
 }
 
-/// Close a court: the running session plays out to its end, but no new groups
-/// land on it, and its queue is released (players get redirected at the desk).
+/// Parse a closure instant: RFC3339 with offset, else a club-local datetime,
+/// else a club-local wall-clock time meaning "today".
+fn parse_close_instant(raw: &str, club: &ClubRow) -> Option<DateTime<Utc>> {
+    let raw = raw.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let local = if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M") {
+        naive
+    } else {
+        club.today().and_time(time::parse_hhmm(raw)?)
+    };
+    use chrono::TimeZone;
+    match club.tz().from_local_datetime(&local) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            Some(dt.with_timezone(&Utc))
+        }
+        chrono::LocalResult::None => None,
+    }
+}
+
+/// Close a court for a timed window (v2): custom reason + from/until. The
+/// running session plays out to its end, but no new groups land on it, its
+/// queue is released, and the court reopens ITSELF when the window ends (the
+/// engine broadcasts at both boundaries).
 pub async fn admin_close_court(
     State(state): State<AppState>,
     Path((slug, number)): Path<(String, i32)>,
@@ -806,15 +876,42 @@ pub async fn admin_close_court(
 ) -> Result<Json<ApiResponse<Value>>, ApiError> {
     let club = require_club_admin(&state, &slug, &token).await?;
     reject_suspended(&club)?;
-    let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    // Strip ASCII control chars (defense-in-depth for the public board — the
+    // FE escapes, but stored text should never carry \n, \r or ESC anyway).
+    let reason: String = req.reason.chars().filter(|c| !c.is_ascii_control()).collect();
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 80 {
+        return Err(ApiError::BadRequest(
+            "A short reason (shown to players) is required.".into(),
+        ));
+    }
+    // DB clock, not the app clock: the immediate-vs-boundary release decision
+    // below must share a clock with COURT_CLOSED_SQL and the engine's
+    // watermarks, or a window whose `from` lands inside the skew is future
+    // per the app yet already past the engine's watermark — released by
+    // neither side, stranding the queue.
+    let now = courts::db_now(&state.db).await?;
+    let from = match &req.from {
+        Some(raw) if !raw.trim().is_empty() => parse_close_instant(raw, &club)
+            .ok_or_else(|| ApiError::BadRequest("Couldn't read the closure start time.".into()))?,
+        _ => now,
+    };
+    let until = parse_close_instant(&req.until, &club)
+        .ok_or_else(|| ApiError::BadRequest("Couldn't read the closure end time.".into()))?;
+    courts::valid_close_window(from, until, now)
+        .map_err(|msg| ApiError::BadRequest(msg.into()))?;
 
     let mut tx = state.db.begin().await?;
     courts::lock_court(&mut tx, club.id, number).await?;
+    // The legacy bool is force-cleared: the window IS the closed state now.
     let updated = sqlx::query(
-        "UPDATE club_courts SET closed = TRUE, closed_reason = $1
-         WHERE club_id = $2 AND number = $3",
+        "UPDATE club_courts
+         SET closed = FALSE, closed_reason = $1, closed_from = $2, closed_until = $3
+         WHERE club_id = $4 AND number = $5",
     )
     .bind(reason)
+    .bind(from)
+    .bind(until)
     .bind(club.id)
     .bind(number)
     .execute(&mut *tx)
@@ -822,26 +919,51 @@ pub async fn admin_close_court(
     if updated.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
-    let released = sqlx::query("DELETE FROM court_queues WHERE club_id = $1 AND court_number = $2")
-        .bind(club.id)
-        .bind(number)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // Release the queue only when the closure starts NOW. A future-dated
+    // window keeps its queue promotable until the window actually begins —
+    // the engine's closure_boundary_pass releases it at the start boundary,
+    // so no group is stranded on a session-less closed court either way.
+    let released = if from <= now {
+        sqlx::query("DELETE FROM court_queues WHERE club_id = $1 AND court_number = $2")
+            .bind(club.id)
+            .bind(number)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    } else {
+        0
+    };
     tx.commit().await?;
 
     state.notify_club(club.id);
+    // tz-aware display string for the confirmation toast.
+    let until_display = until.with_timezone(&club.tz()).format("%H:%M").to_string();
     let msg = if released > 0 {
         format!(
-            "Court {number} closed. {released} queued group(s) were released — \
-             please redirect those players at the desk."
+            "Court {number} closed until {until_display}. {released} queued group(s) were \
+             released — please redirect those players at the desk."
+        )
+    } else if from > now {
+        let from_display = from.with_timezone(&club.tz()).format("%H:%M").to_string();
+        format!(
+            "Court {number} closes {from_display}–{until_display}. Any queue is released \
+             when the closure starts; it reopens automatically."
         )
     } else {
-        format!("Court {number} closed. The current game will play out its timer.")
+        format!("Court {number} closed until {until_display}. It reopens automatically.")
     };
-    Ok(Json(ApiResponse::ok_msg(json!({ "released_groups": released }), msg)))
+    Ok(Json(ApiResponse::ok_msg(
+        json!({
+            "released_groups": released,
+            "closed_from": from.to_rfc3339(),
+            "closed_until": until.to_rfc3339(),
+        }),
+        msg,
+    )))
 }
 
+/// Reopen clears the whole closed state early: window, reason, and the legacy
+/// manual bool.
 pub async fn admin_reopen_court(
     State(state): State<AppState>,
     Path((slug, number)): Path<(String, i32)>,
@@ -850,11 +972,12 @@ pub async fn admin_reopen_court(
     let club = require_club_admin(&state, &slug, &token).await?;
     reject_suspended(&club)?;
     // Same lock contract as close/take/expire: reopening must not race the
-    // engine's closed-flag read at the expiry instant.
+    // engine's closed-state read at the expiry instant.
     let mut tx = state.db.begin().await?;
     courts::lock_court(&mut tx, club.id, number).await?;
     let updated = sqlx::query(
-        "UPDATE club_courts SET closed = FALSE, closed_reason = NULL
+        "UPDATE club_courts
+         SET closed = FALSE, closed_reason = NULL, closed_from = NULL, closed_until = NULL
          WHERE club_id = $1 AND number = $2",
     )
     .bind(club.id)
@@ -869,76 +992,38 @@ pub async fn admin_reopen_court(
     Ok(Json(ApiResponse::message(format!("Court {number} reopened."))))
 }
 
-// ---- club admin: credentials ------------------------------------------------
-
-/// Issue a fresh kiosk credential pair; the pair is shown once in the console
-/// (and printed on a slip at the desk).
-pub async fn admin_issue_credential(
-    State(state): State<AppState>,
-    Path(slug): Path<String>,
-    token: ClubAdminToken,
-) -> Result<Json<ApiResponse<Value>>, ApiError> {
-    let club = require_club_admin(&state, &slug, &token).await?;
-    reject_suspended(&club)?;
-    let password = courts::generate_password();
-    // Regenerate on username collision (unique per club).
-    for _ in 0..20 {
-        let username = courts::generate_username();
-        let inserted: Result<(Uuid, DateTime<Utc>), sqlx::Error> = sqlx::query_as(
-            "INSERT INTO club_credentials (club_id, username, password)
-             VALUES ($1, $2, $3) RETURNING id, issued_at",
-        )
-        .bind(club.id)
-        .bind(&username)
-        .bind(&password)
-        .fetch_one(&state.db)
-        .await;
-        match inserted {
-            Ok((id, issued_at)) => {
-                return Ok(Json(ApiResponse::ok(json!({
-                    "id": id,
-                    "username": username,
-                    "password": password,
-                    "status": "active",
-                    "issued_at": issued_at.to_rfc3339(),
-                }))));
-            }
-            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(ApiError::Internal("could not generate a unique username".into()))
-}
-
-#[derive(Deserialize)]
-pub struct CredListQuery {
-    pub today: Option<String>,
-}
+// ---- club admin: today's logins ----------------------------------------------
+//
+// v1's staff-issued credential endpoint is GONE (players self-serve at the
+// stations now); staff instead get a read of TODAY's logins with the passwords
+// visible — the desk reads a forgotten password back to a player, same trust
+// level as the paper slip it replaces.
 
 pub async fn admin_list_credentials(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-    Query(q): Query<CredListQuery>,
     token: ClubAdminToken,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, ApiError> {
     let club = require_club_admin(&state, &slug, &token).await?;
-    let today_only = q.today.as_deref() == Some("1");
-    let since = if today_only { local_midnight_utc() } else { DateTime::<Utc>::MIN_UTC };
 
     type CredRow = (
         Uuid,
         String,
         String,
         String,
+        String,
+        Option<String>,
         DateTime<Utc>,
         Option<i32>,
         Option<i32>,
         Option<i32>,
     );
     let rows: Vec<CredRow> = sqlx::query_as(
-        "SELECT c.id, c.username, c.password, c.status, c.issued_at,
+        "SELECT c.id, c.username, c.password, c.status, c.kind,
+                COALESCE(m.display_name, m.username) AS member_name, c.issued_at,
                 s.court_number, q.court_number, q.position
          FROM club_credentials c
+         LEFT JOIN club_members m ON m.id = c.member_id AND m.club_id = c.club_id
          LEFT JOIN LATERAL (
              SELECT cs.court_number FROM session_players sp
              JOIN court_sessions cs ON cs.id = sp.session_id
@@ -949,35 +1034,259 @@ pub async fn admin_list_credentials(
              JOIN court_queues cq ON cq.id = qp.queue_id
              WHERE qp.credential_id = c.id LIMIT 1
          ) q ON TRUE
-         WHERE c.club_id = $1 AND c.issued_at >= $2
+         WHERE c.club_id = $1 AND c.valid_date = $2
          ORDER BY c.issued_at DESC",
     )
     .bind(club.id)
-    .bind(since)
+    .bind(club.today())
     .fetch_all(&state.db)
     .await?;
 
     let out = rows
         .into_iter()
-        .map(|(id, username, password, status, issued_at, on_court, q_court, q_pos)| {
-            let location = if let Some(court) = on_court {
-                json!({ "kind": "court", "court_number": court, "position": null })
-            } else if let Some(court) = q_court {
-                json!({ "kind": "queue", "court_number": court, "position": q_pos })
-            } else {
-                json!({ "kind": null, "court_number": null, "position": null })
-            };
+        .map(
+            |(id, username, password, status, kind, member_name, issued_at, on_court, q_court, q_pos)| {
+                let location = if let Some(court) = on_court {
+                    json!({ "kind": "court", "court_number": court, "position": null })
+                } else if let Some(court) = q_court {
+                    json!({ "kind": "queue", "court_number": court, "position": q_pos })
+                } else {
+                    json!({ "kind": null, "court_number": null, "position": null })
+                };
+                json!({
+                    "id": id,
+                    "username": username,
+                    "password": password,
+                    "status": status,
+                    "kind": kind,
+                    "member_name": member_name,
+                    "issued_at": issued_at.to_rfc3339(),
+                    "where": location,
+                })
+            },
+        )
+        .collect();
+    Ok(Json(ApiResponse::ok(out)))
+}
+
+// ---- club admin: members ------------------------------------------------------
+
+pub async fn admin_list_members(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    token: ClubAdminToken,
+) -> Result<Json<ApiResponse<Vec<Value>>>, ApiError> {
+    let club = require_club_admin(&state, &slug, &token).await?;
+    let rows: Vec<(Uuid, String, String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, member_ref, username, display_name, created_at
+         FROM club_members WHERE club_id = $1 AND status = 'active'
+         ORDER BY created_at DESC",
+    )
+    .bind(club.id)
+    .fetch_all(&state.db)
+    .await?;
+    let out = rows
+        .into_iter()
+        .map(|(id, member_ref, username, display_name, created_at)| {
             json!({
                 "id": id,
+                "member_ref": member_ref,
                 "username": username,
-                "password": password,
-                "status": status,
-                "issued_at": issued_at.to_rfc3339(),
-                "where": location,
+                "display_name": display_name,
+                "created_at": created_at.to_rfc3339(),
             })
         })
         .collect();
     Ok(Json(ApiResponse::ok(out)))
+}
+
+#[derive(Deserialize)]
+pub struct AddMemberReq {
+    pub member_ref: String,
+    pub username: String,
+    pub display_name: Option<String>,
+}
+
+/// Add a member: link their existing card (member_ref — what the barcode
+/// encodes) to a permanent kiosk username.
+pub async fn admin_add_member(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    token: ClubAdminToken,
+    Json(req): Json<AddMemberReq>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let club = require_club_admin(&state, &slug, &token).await?;
+    reject_suspended(&club)?;
+    let member_ref = req.member_ref.trim().to_string();
+    if member_ref.is_empty() || member_ref.chars().count() > 64 {
+        return Err(ApiError::BadRequest("Member ID must be 1–64 characters.".into()));
+    }
+    let username = req.username.trim().to_lowercase();
+    if !courts::valid_kiosk_username(&username) {
+        return Err(ApiError::BadRequest(
+            "Username must be 3–20 characters of a-z, 0-9, dot, dash or underscore.".into(),
+        ));
+    }
+    let display_name = req
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    if display_name.as_deref().is_some_and(|n| n.chars().count() > 60) {
+        return Err(ApiError::BadRequest("Display name must be at most 60 characters.".into()));
+    }
+    // Serialize with walkin_create on the (club, username) advisory lock —
+    // this is the other half of the cross-table check-then-insert pair (we
+    // check club_credentials then insert club_members; the walk-in station
+    // checks club_members then inserts club_credentials). This lock is the
+    // ONLY advisory lock this path takes (see courts::lock_username's global
+    // lock-order note).
+    let mut tx = state.db.begin().await?;
+    courts::lock_username(&mut tx, club.id, &username).await?;
+    // A walk-in already holds this username TODAY: adding the member now would
+    // brick their first check-in (today's credential slot is taken).
+    let taken_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM club_credentials
+         WHERE club_id = $1 AND username = $2 AND valid_date = $3",
+    )
+    .bind(club.id)
+    .bind(&username)
+    .bind(club.today())
+    .fetch_one(&mut *tx)
+    .await?;
+    if taken_today > 0 {
+        return Err(ApiError::Conflict(format!(
+            "A walk-in is using \"{username}\" today — it frees up at midnight; \
+             pick another username or add the member tomorrow."
+        )));
+    }
+
+    let inserted: Result<(Uuid, DateTime<Utc>), sqlx::Error> = sqlx::query_as(
+        "INSERT INTO club_members (club_id, member_ref, username, display_name)
+         VALUES ($1, $2, $3, $4) RETURNING id, created_at",
+    )
+    .bind(club.id)
+    .bind(&member_ref)
+    .bind(&username)
+    .bind(&display_name)
+    .fetch_one(&mut *tx)
+    .await;
+    let (id, created_at) = inserted.map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            // Two partial unique indexes — tell the admin which field clashed.
+            if db.constraint() == Some("club_members_ref_active") {
+                ApiError::Conflict(format!("Member ID \"{member_ref}\" is already registered."))
+            } else {
+                ApiError::Conflict(format!("Username \"{username}\" already belongs to a member."))
+            }
+        }
+        _ => ApiError::Db(e),
+    })?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::ok_msg(
+        json!({
+            "id": id,
+            "member_ref": member_ref,
+            "username": username,
+            "display_name": display_name,
+            "created_at": created_at.to_rfc3339(),
+        }),
+        "Member added.",
+    )))
+}
+
+/// Remove a member (soft): the card + username free up for reuse from
+/// TOMORROW; today's credential (if they checked in) is revoked immediately.
+pub async fn admin_remove_member(
+    State(state): State<AppState>,
+    Path((slug, id)): Path<(String, Uuid)>,
+    token: ClubAdminToken,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let club = require_club_admin(&state, &slug, &token).await?;
+    reject_suspended(&club)?;
+    let mut tx = state.db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE club_members SET status = 'removed'
+         WHERE id = $1 AND club_id = $2 AND status = 'active'",
+    )
+    .bind(id)
+    .bind(club.id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    // Revoke today's pass. If it sits in a queue OR an active session,
+    // serialize with that court first — same lock rule as
+    // admin_revoke_credential.
+    let today_cred: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM club_credentials
+         WHERE club_id = $1 AND member_id = $2 AND valid_date = $3 AND status = 'active'",
+    )
+    .bind(club.id)
+    .bind(id)
+    .bind(club.today())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((cred_id,)) = today_cred {
+        lock_placement_courts(&mut tx, club.id, cred_id).await?;
+        sqlx::query("UPDATE club_credentials SET status = 'revoked' WHERE id = $1")
+            .bind(cred_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(ApiResponse::message(
+        "Member removed. Their card and username free up tomorrow; today's pass is revoked.",
+    )))
+}
+
+/// Advisory-lock every court the credential is currently placed on (queue
+/// AND/OR active session), ascending, before a status UPDATE. Queue: without
+/// the lock the engine could promote the group between its revoked-members
+/// check and the UPDATE committing. Session: without it a revoke committing
+/// between expire_court's session-players validity read and its commit lets a
+/// just-revoked group receive one full auto-extension. Ascending order keeps
+/// the global court-lock order acyclic if both somehow apply.
+async fn lock_placement_courts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    club_id: Uuid,
+    cred_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let mut courts_to_lock: Vec<i32> = Vec::new();
+    let queued: Option<(i32,)> = sqlx::query_as(
+        "SELECT q.court_number FROM queue_players qp
+         JOIN court_queues q ON q.id = qp.queue_id
+         WHERE qp.credential_id = $1 AND q.club_id = $2
+         LIMIT 1",
+    )
+    .bind(cred_id)
+    .bind(club_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((court_number,)) = queued {
+        courts_to_lock.push(court_number);
+    }
+    let in_session: Option<(i32,)> = sqlx::query_as(
+        "SELECT cs.court_number FROM session_players sp
+         JOIN court_sessions cs ON cs.id = sp.session_id
+         WHERE sp.credential_id = $1 AND cs.club_id = $2 AND cs.status = 'active'
+         LIMIT 1",
+    )
+    .bind(cred_id)
+    .bind(club_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((court_number,)) = in_session {
+        courts_to_lock.push(court_number);
+    }
+    courts_to_lock.sort_unstable();
+    courts_to_lock.dedup();
+    for court_number in courts_to_lock {
+        courts::lock_court(tx, club_id, court_number).await?;
+    }
+    Ok(())
 }
 
 /// Revoke a credential. It stays wherever it currently is (board unchanged);
@@ -990,22 +1299,9 @@ pub async fn admin_revoke_credential(
     let club = require_club_admin(&state, &slug, &token).await?;
     reject_suspended(&club)?;
     let mut tx = state.db.begin().await?;
-    // If the credential sits in a queue, serialize with that court's promotion
-    // path: without the lock, the engine could promote the group between its
-    // revoked-members check and this UPDATE committing.
-    let queued: Option<(i32,)> = sqlx::query_as(
-        "SELECT q.court_number FROM queue_players qp
-         JOIN court_queues q ON q.id = qp.queue_id
-         WHERE qp.credential_id = $1 AND q.club_id = $2
-         LIMIT 1",
-    )
-    .bind(id)
-    .bind(club.id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((court_number,)) = queued {
-        courts::lock_court(&mut tx, club.id, court_number).await?;
-    }
+    // Serialize with the engine on any court this credential currently
+    // occupies (queue promotion AND session auto-extend both read validity).
+    lock_placement_courts(&mut tx, club.id, id).await?;
     let updated = sqlx::query(
         "UPDATE club_credentials SET status = 'revoked' WHERE id = $1 AND club_id = $2",
     )
@@ -1227,6 +1523,204 @@ pub async fn kiosk_queue(
         result,
         &format!("You're queued for court {}.", req.court_number),
     )
+}
+
+// ---- kiosk: unsign (leave court / leave queue) --------------------------------
+//
+// Deliberately NOT gated on opening hours: players must always be able to sign
+// out (the engine keeps promoting after close for the same reason). The
+// password lockout still applies — these endpoints verify credentials too.
+
+pub async fn kiosk_leave(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Json(req): Json<KioskActionReq>,
+) -> Result<Response, ApiError> {
+    let club = kiosk_club(&state, &slug).await?;
+    if !(1..=club.court_count).contains(&req.court_number) {
+        return Err(ApiError::BadRequest(format!(
+            "Court number must be between 1 and {}.",
+            club.court_count
+        )));
+    }
+    check_kiosk_lockouts(&state, club.id, &req.players).await?;
+    let result = courts::leave_court(&state.db, &club, req.court_number, &req.players)
+        .await
+        .map(|o| {
+            json!({
+                "court_number": req.court_number,
+                "session_ended": o.session_ended,
+                "promoted": o.promoted,
+            })
+        });
+    note_kiosk_failures(&state, club.id, &result).await;
+    if result.is_ok() {
+        state.notify_club(club.id);
+    }
+    action_response(
+        result,
+        &format!("You're signed off court {} — thanks for playing!", req.court_number),
+    )
+}
+
+pub async fn kiosk_queue_leave(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Json(req): Json<KioskActionReq>,
+) -> Result<Response, ApiError> {
+    let club = kiosk_club(&state, &slug).await?;
+    if !(1..=club.court_count).contains(&req.court_number) {
+        return Err(ApiError::BadRequest(format!(
+            "Court number must be between 1 and {}.",
+            club.court_count
+        )));
+    }
+    check_kiosk_lockouts(&state, club.id, &req.players).await?;
+    let result = courts::leave_queue(&state.db, &club, req.court_number, &req.players)
+        .await
+        .map(|removed_group| {
+            json!({ "court_number": req.court_number, "removed_group": removed_group })
+        });
+    note_kiosk_failures(&state, club.id, &result).await;
+    if result.is_ok() {
+        state.notify_club(club.id);
+    }
+    action_response(
+        result,
+        &format!("You've left the queue for court {}.", req.court_number),
+    )
+}
+
+// ---- walk-in signup station ---------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WalkinReq {
+    pub username: String,
+}
+
+/// Live availability probe for the walk-in station (no side effects). The
+/// light per-IP cap keeps it from doubling as an unmetered member-username
+/// oracle.
+pub async fn walkin_check(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<WalkinReq>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let club = kiosk_club(&state, &slug).await?;
+    let username = req.username.trim().to_lowercase();
+    if username.chars().count() > 64 {
+        return Err(ApiError::BadRequest("Username is too long.".into()));
+    }
+    otp::check_walkin_probe_cap(&state, club.id, ip).await?;
+    let reason = courts::walkin_unavailable_reason(&state.db, &club, &username).await?;
+    Ok(Json(ApiResponse::ok(match reason {
+        None => json!({ "available": true }),
+        Some(reason) => json!({ "available": false, "reason": reason }),
+    })))
+}
+
+/// Claim a walk-in username for today; the station shows the generated
+/// password big. Per-IP creation cap prevents namespace squatting.
+pub async fn walkin_create(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<WalkinReq>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let club = kiosk_club(&state, &slug).await?;
+    if !club.open_now() {
+        return Err(ApiError::BadRequest(format!(
+            "The club is closed — signups open {}–{}.",
+            club.opens_at.format("%H:%M"),
+            club.closes_at.format("%H:%M"),
+        )));
+    }
+    let username = req.username.trim().to_lowercase();
+    if username.chars().count() > 64 {
+        return Err(ApiError::BadRequest("Username is too long.".into()));
+    }
+    otp::check_walkin_create_cap(&state, club.id, ip).await?;
+    match courts::walkin_create(&state.db, &club, &username).await {
+        Ok(password) => Ok(Json(ApiResponse::ok_msg(
+            json!({ "username": username, "password": password }),
+            "You're signed up for today — grab a court on the board!",
+        ))),
+        Err(courts::WalkinError::Unavailable("invalid")) => Err(ApiError::BadRequest(
+            "Username must be 3–20 characters of a-z, 0-9, dot, dash or underscore.".into(),
+        )),
+        Err(courts::WalkinError::Unavailable(_)) => Err(ApiError::Conflict(format!(
+            "\"{username}\" is taken today — try another username."
+        ))),
+        Err(courts::WalkinError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
+// ---- member check-in station --------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CheckinReq {
+    pub member_ref: String,
+}
+
+/// Member check-in: scan/type the member card ID, get the permanent username +
+/// today's password (same password all day, fresh one tomorrow).
+pub async fn member_checkin(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<CheckinReq>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    let club = kiosk_club(&state, &slug).await?;
+    if !club.open_now() {
+        return Err(ApiError::BadRequest(format!(
+            "The club is closed — check-in opens {}–{}.",
+            club.opens_at.format("%H:%M"),
+            club.closes_at.format("%H:%M"),
+        )));
+    }
+    let member_ref = req.member_ref.trim().to_string();
+    if member_ref.is_empty() || member_ref.chars().count() > 64 {
+        return Err(ApiError::BadRequest("Scan your card or type your member ID.".into()));
+    }
+    // Sliding cap on ALL check-in attempts (valid or not): a VALID member_ref
+    // returns today's password, so without this a station IP could walk a
+    // dense card-number space and harvest real credentials without ever
+    // tripping the unknown-ref lockout below. Fail-open like the other
+    // request limiters — the unknown-ref lockout stays fail-closed.
+    otp::check_checkin_attempt_cap(&state, club.id, ip).await?;
+    // Unknown-ref lockout, mirroring the kiosk password lockout (member IDs
+    // are guessable card numbers — enumeration gets cut off, real members see
+    // a generic message that reveals nothing).
+    if otp::is_checkin_locked(state.redis.clone(), club.id, ip).await {
+        return Err(ApiError::RateLimited(
+            "Too many attempts. Please try again later or see the front desk.".into(),
+        ));
+    }
+    match courts::member_checkin(&state.db, &club, &member_ref).await {
+        Ok(res) => Ok(Json(ApiResponse::ok(json!({
+            "display_name": res.display_name,
+            "member_ref": res.member_ref,
+            "username": res.username,
+            "password": res.password,
+        })))),
+        Err(courts::CheckinError::UnknownMember) => {
+            if otp::note_checkin_unknown_ref(state.redis.clone(), club.id, ip).await {
+                tracing::warn!(club_id = %club.id, %ip, "check-in station locked after repeated unknown member IDs");
+                crate::metrics::record_feature("checkin_station_locked", "web");
+            }
+            Err(ApiError::BadRequest(
+                "We couldn't find that member ID. Check the card, or see the front desk.".into(),
+            ))
+        }
+        Err(courts::CheckinError::Revoked) => Err(ApiError::Conflict(
+            "Today's pass for this membership was cancelled — please see the front desk.".into(),
+        )),
+        Err(courts::CheckinError::UsernameHeld) => Err(ApiError::Conflict(
+            "That username is held by a walk-in today — see the front desk.".into(),
+        )),
+        Err(courts::CheckinError::Db(e)) => Err(ApiError::Db(e)),
+    }
 }
 
 // ---- tests ------------------------------------------------------------------
